@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.env
+venv/
+.venv/
+
+# Model weights (large binary files — download separately)
+*.pt
+*.pth
+*.onnx
+runs/
+
+# Database & evidence (runtime data)
+evidence_store/violations.db
+evidence_store/snapshots/
+
+# Node / Vite
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp files
+*.tmp
+*.log
+tmp_*
+
+# EasyOCR cache
+.EasyOCR/
