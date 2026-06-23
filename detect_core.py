@@ -35,23 +35,24 @@ def bbox_iou_overlap(b1, b2) -> float:
     area1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
     return inter / (area1 + 1e-6)
 
-def person_on_motorcycle(person_bbox, bike_bbox, tolerance: int = 55) -> bool:
+def person_on_motorcycle(person_bbox, bike_bbox, tolerance: int = 20) -> bool:
     px_c = (person_bbox[0] + person_bbox[2]) / 2
     bx_c = (bike_bbox[0]  + bike_bbox[2])  / 2
     bw   = bike_bbox[2] - bike_bbox[0]
     horizontal_ok = abs(px_c - bx_c) < bw / 2 + tolerance
 
-    # Rider's body must substantially overlap with the bike bounding box
     person_bottom = person_bbox[3]
     bike_top      = bike_bbox[1]
     bike_bottom   = bike_bbox[3]
     bike_height   = bike_bottom - bike_top
-    # Person's bottom must be within the bike's vertical range (not just nearby)
-    vertical_ok = bike_top - bike_height * 0.3 < person_bottom < bike_bottom + bike_height * 0.4
+    # Person bottom must be clearly within the bike's vertical span
+    vertical_ok = bike_top - bike_height * 0.10 < person_bottom < bike_bottom + bike_height * 0.15
 
-    overlap_ok = bbox_iou_overlap(person_bbox, bike_bbox) > 0.05
+    # Require solid overlap — pedestrians on the footpath beside the bike won't
+    # have their bbox overlapping the bike bbox at this level
+    overlap_ok = bbox_iou_overlap(person_bbox, bike_bbox) > 0.20
 
-    return horizontal_ok and (overlap_ok or vertical_ok)
+    return horizontal_ok and overlap_ok and vertical_ok
 
 def extract_geometric_features(bbox, img_shape) -> dict:
     x1, y1, x2, y2 = bbox
@@ -87,7 +88,7 @@ def classify_helmet(person_bbox, frame_bgr: np.ndarray, helmet_model):
         scale = max(2, int(96 / max(min(crop.shape[:2]), 1)))
         crop  = cv2.resize(crop, None, fx=scale, fy=scale,
                            interpolation=cv2.INTER_CUBIC)
-    results = helmet_model(crop, conf=0.20, verbose=False)
+    results = helmet_model(crop, conf=0.10, verbose=False)
     boxes   = results[0].boxes
     if not boxes:
         return None, 0.0
@@ -215,22 +216,43 @@ def annotate(frame: np.ndarray, violations: list, vehicles: list | None = None) 
     # Build set of violating vehicle IDs for quick lookup
     violation_vid_set = {v.get("vehicle_id") for v in violations if v.get("vehicle_id")}
 
+    img_h, img_w = out.shape[:2]
+
+    def expand_for_rider(x1, y1, x2, y2, cls=''):
+        """Expand a vehicle bbox upward so the rider sitting on top is included."""
+        bh = y2 - y1
+        bw = x2 - x1
+        # Motorcycles: rider sits above the detected bike box — extend up by 85%
+        # Cars/trucks: driver is inside, no upward expansion needed
+        is_moto = any(k in cls.lower() for k in ('motor', 'bike', 'cycl', 'scoot'))
+        up = int(bh * 0.85) if is_moto else 0
+        pad_x = int(bw * 0.08)
+        return (
+            max(0, x1 - pad_x),
+            max(0, y1 - up),
+            min(img_w, x2 + pad_x),
+            min(img_h, y2),
+        )
+
     # ── 1. Draw all vehicles with their ID label ───────────────────────────────
     if vehicles:
         for veh in vehicles:
-            x1, y1, x2, y2 = [int(c) for c in veh["bbox"]]
+            rx1, ry1, rx2, ry2 = [int(c) for c in veh["bbox"]]
             vid = veh["id"]
+            cls = veh.get("cls", "")
             is_violator = vid in violation_vid_set
+
+            x1, y1, x2, y2 = expand_for_rider(rx1, ry1, rx2, ry2, cls)
 
             # Violating vehicles get a bold coloured border; clean vehicles get grey
             box_color = (0, 60, 200) if is_violator else VEHICLE_BOX_COLOR
             box_thick = 2 if is_violator else 1
             cv2.rectangle(out, (x1, y1), (x2, y2), box_color, box_thick)
 
-            # ID tag (bottom-left of box so it doesn't clash with violation label at top)
+            # ID tag anchored to bottom of expanded box
             id_label = vid
             (tw, th), bl = cv2.getTextSize(id_label, font, 0.38, 1)
-            tag_y = y2  # anchor to bottom of box
+            tag_y = y2
             cv2.rectangle(out, (x1, tag_y - th - bl - 2), (x1 + tw + 6, tag_y + 2),
                           VEHICLE_ID_COLOR, -1)
             cv2.putText(out, id_label, (x1 + 3, tag_y - bl - 1),
@@ -239,7 +261,11 @@ def annotate(frame: np.ndarray, violations: list, vehicles: list | None = None) 
     # ── 2. Draw violation overlays (bold, coloured, labelled) ─────────────────
     seen_boxes: list = []  # avoid stacking duplicate labels at same position
     for v in violations:
-        x1, y1, x2, y2 = [int(c) for c in v["bbox"]]
+        rx1, ry1, rx2, ry2 = [int(c) for c in v["bbox"]]
+        # Helmet violations: expand up to show the rider, not just the bike frame
+        is_helmet = "helmet" in v.get("type", "").lower()
+        x1, y1, x2, y2 = expand_for_rider(rx1, ry1, rx2, ry2,
+                                            "motor" if is_helmet else "")
         col = SEVERITY_COLOR.get(v.get("severity", "LOW"), (50, 200, 80))
 
         cv2.rectangle(out, (x1, y1), (x2, y2), col, 3)
@@ -349,11 +375,34 @@ def detect_violations(
             cls_name, helm_conf = classify_helmet(person_bbox, frame_bgr, helmet_model)
             checked = True
             status = helmet_status(cls_name)
-            if status == "no_helmet" and helm_conf >= 0.20:
+            # Per-class thresholds based on val metrics:
+            # passenger_without_helmet → precision 65%, raise bar to cut false positives
+            # motorcycle_without_helmet → recall 49.6%, lower bar to catch more violations
+            _cls_lower = str(cls_name).lower()
+            if "passenger" in _cls_lower and "without" in _cls_lower:
+                _helm_thresh = 0.55
+            elif "motorcycle" in _cls_lower and "without" in _cls_lower:
+                _helm_thresh = 0.15
+            else:
+                _helm_thresh = 0.20
+            if status == "no_helmet" and helm_conf >= _helm_thresh:
+                # Evidence crop: union of person + bike bboxes, padded generously
+                # so the full rider (head to feet) AND the vehicle are both visible
+                px1, py1, px2, py2 = [int(c) for c in person_bbox]
+                bx1, by1, bx2, by2 = [int(c) for c in bike_bbox]
+                ux1 = min(px1, bx1)
+                uy1 = min(py1, by1)
+                ux2 = max(px2, bx2)
+                uy2 = max(py2, by2)
+                uw, uh = ux2 - ux1, uy2 - uy1
+                pad_x = int(uw * 0.15)
+                pad_y = int(uh * 0.12)
+                union_bbox = [max(0, ux1 - pad_x), max(0, uy1 - pad_y), ux2 + pad_x, uy2 + pad_y]
                 violations.append({
                     "type":        "Helmet Non-Compliance",
                     "confidence":  round(helm_conf, 2),
                     "bbox":        person_bbox,
+                    "crop_bbox":   union_bbox,
                     "track_id":    bike_tid,
                     "vehicle_id":  bike_vid,
                     "severity":    "HIGH" if helm_conf >= 0.45 else "MEDIUM",
@@ -365,20 +414,23 @@ def detect_violations(
         if checked:
             continue
 
-        # Strategy B: no separate person bbox — in CCTV/elevated angles the rider
-        # and bike are often merged. Crop the TOP 55% of the motorcycle bbox
-        # (where the rider's torso/head sits) and run helmet model directly.
+        # Strategy B: no separate person bbox — extend the crop ABOVE the bike
+        # bbox to capture the rider's torso/head which sits above the detected box.
         x1, y1, x2, y2 = [int(c) for c in bike_bbox]
         bh = y2 - y1
-        rider_y2 = y1 + max(int(bh * 0.55), 20)
-        bike_crop = frame_bgr[max(0, y1):rider_y2, max(0, x1):x2]
+        bw = x2 - x1
+        rider_top = max(0, y1 - int(bh * 0.80))   # reach 80% of bike height above
+        rider_y2  = y1 + max(int(bh * 0.55), 20)  # keep bottom half for context
+        side_ext  = int(bw * 0.10)
+        bike_crop = frame_bgr[rider_top:rider_y2,
+                               max(0, x1 - side_ext):x2 + side_ext]
         if bike_crop.size == 0 or min(bike_crop.shape[:2]) < 12:
             continue
         if min(bike_crop.shape[:2]) < 80:
             scale = max(2, int(96 / max(min(bike_crop.shape[:2]), 1)))
             bike_crop = cv2.resize(bike_crop, None, fx=scale, fy=scale,
                                    interpolation=cv2.INTER_CUBIC)
-        res2  = helmet_model(bike_crop, conf=0.18, verbose=False)
+        res2  = helmet_model(bike_crop, conf=0.10, verbose=False)
         boxes2 = res2[0].boxes
         if not boxes2:
             continue
@@ -386,11 +438,33 @@ def detect_violations(
         best2  = max(boxes2, key=lambda bx: float(bx.conf))
         cls2, conf2 = names2[int(best2.cls)], float(best2.conf)
         geo = extract_geometric_features(bike_bbox, img_shape)
-        if helmet_status(cls2) == "no_helmet" and conf2 >= 0.22:
+        _cls2_lower = str(cls2).lower()
+        if "passenger" in _cls2_lower and "without" in _cls2_lower:
+            _thresh2 = 0.55
+        elif "motorcycle" in _cls2_lower and "without" in _cls2_lower:
+            _thresh2 = 0.15
+        else:
+            _thresh2 = 0.22
+        if helmet_status(cls2) == "no_helmet" and conf2 >= _thresh2:
+            # A rider sitting on a motorcycle has their torso+head extending
+            # ~80% of bike height ABOVE the detected bike bbox. Pad heavily upward
+            # and add side padding so the full rider + vehicle appear in the crop.
+            bh = y2 - y1
+            bw = x2 - x1
+            up_pad   = int(bh * 0.80)   # capture head/torso above bike box
+            side_pad = int(bw * 0.15)   # a bit of context on the sides
+            down_pad = int(bh * 0.10)   # small pad below to show wheels
+            rider_crop_bbox = [
+                max(0, x1 - side_pad),
+                max(0, y1 - up_pad),
+                x2 + side_pad,
+                y2 + down_pad,
+            ]
             violations.append({
                 "type":        "Helmet Non-Compliance",
                 "confidence":  round(conf2, 2),
                 "bbox":        bike_bbox,
+                "crop_bbox":   rider_crop_bbox,
                 "track_id":    bike_tid,
                 "vehicle_id":  bike_vid,
                 "severity":    "HIGH" if conf2 >= 0.45 else "MEDIUM",
@@ -467,46 +541,38 @@ def detect_violations(
         seen_ws = set()
         for vb, vc, vt, vv in all_vehicles:
             x1, y1, x2, y2 = [int(c) for c in vb]
-            v_crop = frame_bgr[max(0, y1):y2, max(0, x1):x2]
+            bh, bw = y2 - y1, x2 - x1
+            # Tighten crop to the lower 70% of the vehicle bbox — avoids
+            # capturing billboards/signs that sit above large buses/trucks
+            tight_y1 = y1 + int(bh * 0.30)
+            v_crop = frame_bgr[max(0, tight_y1):y2, max(0, x1):x2]
             if v_crop.size == 0 or v_crop.shape[0] < 40 or v_crop.shape[1] < 40:
                 continue
-            ws_res = wrongside_model(v_crop, conf=0.40, verbose=False)
+            ws_res = wrongside_model(v_crop, conf=0.45, verbose=False)
             for r in ws_res[0].boxes:
                 cls_name = ws_res[0].names[int(r.cls)]
                 ws_conf  = float(r.conf)
-                if "wrong" in cls_name.lower() and ws_conf >= 0.40:
+                # Raised to 0.55 — reduces false positives on busy scenes
+                if "wrong" in cls_name.lower() and ws_conf >= 0.55:
                     key = vv or (tuple(int(c) // 40 for c in vb))
                     if key not in seen_ws:
                         seen_ws.add(key)
+                        # crop_bbox uses the tightened region so evidence photo
+                        # shows the vehicle body, not the billboard above it
+                        tight_bbox = [x1, tight_y1, x2, y2]
                         violations.append({
                             "type":        "Wrong-Side Driving",
                             "confidence":  round(ws_conf, 2),
                             "bbox":        vb,
+                            "crop_bbox":   tight_bbox,
                             "track_id":    vt,
                             "vehicle_id":  vv,
                             "severity":    "CRITICAL",
                             "description": f"{vv}: wrong-side driving detected (conf {ws_conf:.0%}).",
                         })
                     break
-    elif wrong_side_present and all_vehicles and scene_type != "Parking Area":
-        scored = []
-        for vb, vc, vt, vv in all_vehicles:
-            geo   = extract_geometric_features(vb, img_shape)
-            score = geo["norm_x"] if "Right" in flow_direction else (1 - geo["norm_x"])
-            scored.append((score, vb, vc, vt, vv, geo))
-        scored.sort(key=lambda s: s[0])
-        if scored:
-            _, vb, vc, vt, vv, geo = scored[0]
-            violations.append({
-                "type":        "Wrong-Side Driving",
-                "confidence":  round(min(vc + 0.03, 0.80), 2),
-                "bbox":        vb,
-                "track_id":    vt,
-                "vehicle_id":  vv,
-                "severity":    "CRITICAL",
-                "description": f"{vv}: heuristic — vehicle at x={geo['norm_x']:.2f} against flow ({flow_direction}).",
-                "geo_features": geo,
-            })
+    # Heuristic fallback removed — caused too many false positives on busy
+    # junctions where legitimate oncoming traffic is visible in the frame.
 
     # ── 6. Illegal Parking ────────────────────────────────────────────────────
     if scene_type != "Highway":

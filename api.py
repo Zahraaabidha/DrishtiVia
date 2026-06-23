@@ -42,7 +42,7 @@ DB_PATH  = Path(os.getenv("DB_PATH",  str(BASE_DIR / "evidence_store" / "violati
 SNAP_DIR = Path(os.getenv("SNAP_DIR", str(BASE_DIR / "evidence_store" / "snapshots")))
 SNAP_DIR.mkdir(parents=True, exist_ok=True)
 
-HELMET_PATH    = Path(os.getenv("HELMET_MODEL",    str(BASE_DIR / "runs/detect/runs/helmet_train_v2/violavision_v1/weights/best.pt")))
+HELMET_PATH    = Path(os.getenv("HELMET_MODEL",    str(BASE_DIR / "runs/detect/runs/detect/helmet_v2/weights/best.pt")))
 SEATBELT_PATH  = Path(os.getenv("SEATBELT_MODEL",  str(BASE_DIR / "runs/detect/runs/seatbelt_train/violavision_seatbelt_v1-2/weights/best.pt")))
 WRONGSIDE_PATH = Path(os.getenv("WRONGSIDE_MODEL", str(BASE_DIR / "runs/detect/runs/wrongside_train/violavision_wrongside_v1/weights/best.pt")))
 
@@ -450,13 +450,24 @@ def _persist_violation(viol: dict, frame_bgr, camera_id: str,
     snap_crop = SNAP_DIR / f"{h16}_crop.jpg"
     try:
         if frame_bgr is not None:
-            cv2.imwrite(str(snap_full), frame_bgr)
-            bbox = viol.get("bbox")
-            if bbox and len(bbox) == 4:
-                x1, y1, x2, y2 = [max(0, int(c)) for c in bbox]
+            jpg_params = [cv2.IMWRITE_JPEG_QUALITY, 92]
+            cv2.imwrite(str(snap_full), frame_bgr, jpg_params)
+            # Use crop_bbox if provided, else fall back to bbox
+            crop_ref = viol.get("crop_bbox") or viol.get("bbox")
+            if crop_ref and len(crop_ref) == 4:
+                x1, y1, x2, y2 = [max(0, int(c)) for c in crop_ref]
+                ih, iw = frame_bgr.shape[:2]
+                x2, y2 = min(x2, iw), min(y2, ih)
                 crop = frame_bgr[y1:y2, x1:x2]
                 if crop.size > 0:
-                    cv2.imwrite(str(snap_crop), crop)
+                    # Upscale tiny crops to at least 400px wide so they're
+                    # not blurry when displayed in the evidence modal
+                    cw = crop.shape[1]
+                    if cw < 400 and cw > 0:
+                        scale = 400 / cw
+                        crop = cv2.resize(crop, None, fx=scale, fy=scale,
+                                          interpolation=cv2.INTER_LANCZOS4)
+                    cv2.imwrite(str(snap_crop), crop, jpg_params)
     except Exception:
         pass
 

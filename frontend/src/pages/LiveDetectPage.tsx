@@ -64,15 +64,21 @@ function ViolationModal({ v, onClose }: { v: DetectionViolation; onClose: () => 
           <div className="grid grid-cols-2 gap-3 p-6 pb-4">
             <div>
               <p className="text-[10px] font-bold tracking-widest uppercase text-neutral-400 mb-2">Full Frame</p>
-              <img src={snapshotUrl(v.evidence_hash, "full")} alt="full frame"
-                className="w-full rounded border border-neutral-100 object-cover"
-                onError={e => { (e.target as HTMLImageElement).style.display = "none"; }}/>
+              <div className="w-full rounded border border-neutral-100 bg-neutral-50 overflow-hidden" style={{ height: 200 }}>
+                <img src={snapshotUrl(v.evidence_hash, "full")} alt="full frame"
+                  loading="eager"
+                  className="w-full h-full object-cover"
+                  onError={e => { (e.target as HTMLImageElement).parentElement!.style.display = "none"; }}/>
+              </div>
             </div>
             <div>
               <p className="text-[10px] font-bold tracking-widest uppercase text-neutral-400 mb-2">Vehicle Crop</p>
-              <img src={snapshotUrl(v.evidence_hash, "crop")} alt="vehicle crop"
-                className="w-full rounded border border-neutral-100 object-cover"
-                onError={e => { (e.target as HTMLImageElement).style.display = "none"; }}/>
+              <div className="w-full rounded border border-neutral-100 bg-neutral-50 overflow-hidden" style={{ height: 200 }}>
+                <img src={snapshotUrl(v.evidence_hash, "crop")} alt="vehicle crop"
+                  loading="eager"
+                  className="w-full h-full object-contain"
+                  onError={e => { (e.target as HTMLImageElement).parentElement!.style.display = "none"; }}/>
+              </div>
             </div>
           </div>
         ) : (

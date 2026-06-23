@@ -32,7 +32,12 @@ const HackathonBadge = () => (
 
 const NAV_LINKS = ['Features', 'Models', 'How It Works', 'GitHub']
 
-export default function HeroSection() {
+interface HeroProps {
+  /** Set to true when the preloader has revealed the page — starts entrance animation */
+  animReady?: boolean
+}
+
+export default function HeroSection({ animReady = true }: HeroProps) {
   const time = useBengaluruTime()
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const labelRef = useRef<HTMLParagraphElement>(null)
@@ -40,6 +45,7 @@ export default function HeroSection() {
   const ctaRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
+    if (!animReady) return
     const tl = gsap.timeline({ delay: 0.2 })
 
     if (labelRef.current) {
@@ -66,9 +72,8 @@ export default function HeroSection() {
       )
     }
 
-    const heroEl = document.querySelector('.hero-section') as HTMLElement
+    const heroEl  = document.querySelector('.hero-section') as HTMLElement
     const videoEl = document.querySelector('.hero-video') as HTMLElement
-
     if (heroEl && videoEl) {
       gsap.to(videoEl, {
         scrollTrigger: {
@@ -81,7 +86,7 @@ export default function HeroSection() {
         ease: 'none',
       })
     }
-  }, [])
+  }, [animReady])
 
   return (
     <section className="hero-section relative min-h-screen flex flex-col" style={{ backgroundColor: '#111', overflow: 'hidden' }}>
