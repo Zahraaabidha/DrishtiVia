@@ -1,0 +1,15 @@
+names:
+- motorcycle_with_helmet
+- motorcycle_without_helmet
+- passenger_with_helmet
+- passenger_without_helmet
+nc: 4
+roboflow:
+  license: CC BY 4.0
+  project: helmet-violation-detection-zgzh1
+  url: https://universe.roboflow.com/radya-ai/helmet-violation-detection-zgzh1/dataset/11
+  version: 11
+  workspace: radya-ai
+test: ../test/images
+train: ../train/images
+val: ../valid/images
