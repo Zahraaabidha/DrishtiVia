@@ -4,6 +4,10 @@ import { searchViolations, type Violation } from "../../api/client";
 
 const navLinks = [
   {
+    label: "Home", to: "/",
+    icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>,
+  },
+  {
     label: "Dashboard", to: "/dashboard",
     icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>,
   },
@@ -102,7 +106,7 @@ const AppLayout: React.FC<Props> = ({ children }) => {
             <p className="text-[10px] font-bold tracking-[0.18em] uppercase text-neutral-400 px-2 mb-1">Navigation</p>
           )}
           {navLinks.map(link => (
-            <NavLink key={link.to} to={link.to}
+            <NavLink key={link.to} to={link.to} end={link.to === "/"}
               className={({ isActive }) =>
                 `flex items-center gap-2.5 px-2.5 py-2 rounded-[4px] text-[13px] font-medium transition-all ${
                   isActive ? "bg-neutral-900 text-white" : "text-neutral-500 hover:bg-neutral-100 hover:text-neutral-900"

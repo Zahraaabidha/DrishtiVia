@@ -61,7 +61,7 @@ def train(data_yaml):
     print("Starting YOLOv8n helmet fine-tuning")
     print("="*60)
 
-    model = YOLO("yolov8s.pt")   # upgraded: s > n, still fits 4GB VRAM
+    model = YOLO("yolov8m.pt")   # medium: better accuracy than small, ~2-3GB VRAM
 
     import torch
     device = 0 if torch.cuda.is_available() else "cpu"

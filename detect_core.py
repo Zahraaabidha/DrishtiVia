@@ -35,20 +35,21 @@ def bbox_iou_overlap(b1, b2) -> float:
     area1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
     return inter / (area1 + 1e-6)
 
-def person_on_motorcycle(person_bbox, bike_bbox, tolerance: int = 80) -> bool:
+def person_on_motorcycle(person_bbox, bike_bbox, tolerance: int = 40) -> bool:
     px_c = (person_bbox[0] + person_bbox[2]) / 2
     bx_c = (bike_bbox[0]  + bike_bbox[2])  / 2
     bw   = bike_bbox[2] - bike_bbox[0]
     horizontal_ok = abs(px_c - bx_c) < bw / 2 + tolerance
 
-    # Rider sits above the bike — their bottom edge should be near the bike's top,
-    # not necessarily overlapping heavily (common in CCTV/elevated camera angles)
+    # Rider's body must substantially overlap with the bike bounding box
     person_bottom = person_bbox[3]
     bike_top      = bike_bbox[1]
-    bike_height   = bike_bbox[3] - bike_bbox[1]
-    vertical_ok   = abs(person_bottom - bike_top) < bike_height * 1.2
+    bike_bottom   = bike_bbox[3]
+    bike_height   = bike_bottom - bike_top
+    # Person's bottom must be within the bike's vertical range (not just nearby)
+    vertical_ok = bike_top - bike_height * 0.3 < person_bottom < bike_bottom + bike_height * 0.4
 
-    overlap_ok = bbox_iou_overlap(person_bbox, bike_bbox) > 0.02
+    overlap_ok = bbox_iou_overlap(person_bbox, bike_bbox) > 0.05
 
     return horizontal_ok and (overlap_ok or vertical_ok)
 
@@ -86,7 +87,7 @@ def classify_helmet(person_bbox, frame_bgr: np.ndarray, helmet_model):
         scale = max(2, int(96 / max(min(crop.shape[:2]), 1)))
         crop  = cv2.resize(crop, None, fx=scale, fy=scale,
                            interpolation=cv2.INTER_CUBIC)
-    results = helmet_model(crop, conf=0.10, verbose=False)
+    results = helmet_model(crop, conf=0.20, verbose=False)
     boxes   = results[0].boxes
     if not boxes:
         return None, 0.0
@@ -321,50 +322,38 @@ def detect_violations(
                   if person_on_motorcycle(p, bike_bbox)]
 
         if not riders:
-            # No rider paired — flag for human review only.
-            # Never classify helmet status on the motorcycle's own bounding box;
-            # the helmet model is trained on human head crops, not bike chassis.
-            violations.append({
-                "type":        "Helmet Non-Compliance",
-                "confidence":  round(min(bike_conf * 0.5, 0.40), 2),
-                "bbox":        bike_bbox,
-                "track_id":    bike_tid,
-                "vehicle_id":  bike_vid,
-                "severity":    "LOW",
-                "description": f"Motorcycle {bike_vid} detected — rider not separately visible, manual review required.",
-            })
+            # No rider visible — skip entirely rather than generating a false flag.
+            # The motorcycle bounding box is a chassis crop; running the helmet model
+            # on it produces meaningless results (it's trained on human head crops).
             continue
 
-        # Riders detected near the bike
+        # Riders confirmed on the bike — check each one
         for person_bbox, person_conf in riders:
             geo = extract_geometric_features(person_bbox, img_shape)
+
+            # Require a plausible riding posture: person height > width (sitting upright)
+            p_w = person_bbox[2] - person_bbox[0]
+            p_h = person_bbox[3] - person_bbox[1]
+            if p_w > 0 and (p_h / p_w) < 0.8:
+                # Too wide relative to height — more likely a lying/crouching pedestrian
+                continue
+
             if helmet_model is not None and frame_bgr is not None:
                 cls_name, helm_conf = classify_helmet(person_bbox, frame_bgr, helmet_model)
                 if cls_name and "with" in cls_name.lower() and helm_conf >= 0.35:
                     pass  # helmeted — no violation
-                elif cls_name and "without" in cls_name.lower() and helm_conf >= 0.15:
+                elif cls_name and "without" in cls_name.lower() and helm_conf >= 0.35:
                     violations.append({
                         "type":        "Helmet Non-Compliance",
                         "confidence":  round(helm_conf, 2),
                         "bbox":        person_bbox,
                         "track_id":    bike_tid,
                         "vehicle_id":  bike_vid,
-                        "severity":    "HIGH" if helm_conf >= 0.45 else "MEDIUM",
+                        "severity":    "HIGH" if helm_conf >= 0.55 else "MEDIUM",
                         "description": f"Rider on {bike_vid} WITHOUT helmet (conf {helm_conf:.0%}).",
                         "geo_features": geo,
                     })
-                else:
-                    # Inconclusive — flag for review
-                    violations.append({
-                        "type":        "Helmet Non-Compliance",
-                        "confidence":  round(min(person_conf * 0.65, 0.50), 2),
-                        "bbox":        person_bbox,
-                        "track_id":    bike_tid,
-                        "vehicle_id":  bike_vid,
-                        "severity":    "MEDIUM",
-                        "description": f"Rider on {bike_vid} — helmet status inconclusive, review required.",
-                        "geo_features": geo,
-                    })
+                # else: inconclusive — do not flag; let the 2-sighting filter catch repeats
             else:
                 violations.append({
                     "type":        "Helmet Non-Compliance",
