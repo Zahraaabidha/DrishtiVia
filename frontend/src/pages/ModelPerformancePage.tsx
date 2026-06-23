@@ -138,7 +138,7 @@ function ModelCard({ model }: { model: typeof MODELS[0] }) {
               <PolarRadiusAxis angle={90} domain={[0, 100]} tick={false} axisLine={false} />
               <Radar dataKey="value" stroke={model.color} fill={model.color} fillOpacity={0.25} strokeWidth={2} />
               <Tooltip
-                formatter={(v: number) => [`${v}%`, ""]}
+                formatter={(v: unknown) => [`${Number(v ?? 0)}%`, ""] as [string, string]}
                 contentStyle={{ fontSize: 11, borderRadius: 3, border: "1px solid #e5e7eb" }}
               />
             </RadarChart>

@@ -35,7 +35,7 @@ def bbox_iou_overlap(b1, b2) -> float:
     area1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
     return inter / (area1 + 1e-6)
 
-def person_on_motorcycle(person_bbox, bike_bbox, tolerance: int = 40) -> bool:
+def person_on_motorcycle(person_bbox, bike_bbox, tolerance: int = 55) -> bool:
     px_c = (person_bbox[0] + person_bbox[2]) / 2
     bx_c = (bike_bbox[0]  + bike_bbox[2])  / 2
     bw   = bike_bbox[2] - bike_bbox[0]
@@ -94,6 +94,24 @@ def classify_helmet(person_bbox, frame_bgr: np.ndarray, helmet_model):
     names = results[0].names
     best  = max(boxes, key=lambda bx: float(bx.conf))
     return names[int(best.cls)], float(best.conf)
+
+def helmet_status(cls_name) -> str:
+    """
+    Map a helmet-model class label to 'no_helmet' | 'helmeted' | 'unknown'.
+
+    CRITICAL: negatives are checked FIRST because 'without' contains the
+    substring 'with' — a naive `"with" in name` test misclassifies every
+    'without helmet' detection as helmeted and silently drops the violation.
+    """
+    if not cls_name:
+        return "unknown"
+    n = str(cls_name).lower().replace("-", " ").replace("_", " ").strip()
+    if ("without" in n or "no helmet" in n or "nohelmet" in n
+            or n.startswith("no ") or n in ("head", "bare", "nohelmet")):
+        return "no_helmet"
+    if "with" in n or "helmet" in n or "helm" in n:
+        return "helmeted"
+    return "unknown"
 
 # ── plate-colour -> vehicle category ──────────────────────────────────────────
 def classify_plate_category(vehicle_crop: np.ndarray) -> str:
@@ -321,60 +339,69 @@ def detect_violations(
         riders = [(p, pc) for p, pc, pt in persons
                   if person_on_motorcycle(p, bike_bbox)]
 
-        if not riders:
-            # No rider visible — skip entirely rather than generating a false flag.
-            # The motorcycle bounding box is a chassis crop; running the helmet model
-            # on it produces meaningless results (it's trained on human head crops).
+        if helmet_model is None or frame_bgr is None:
             continue
 
-        # Riders confirmed on the bike — check each one
+        # Strategy A: paired person detected — crop their head region
+        checked = False
         for person_bbox, person_conf in riders:
             geo = extract_geometric_features(person_bbox, img_shape)
-
-            # Require a plausible riding posture: person height > width (sitting upright)
-            p_w = person_bbox[2] - person_bbox[0]
-            p_h = person_bbox[3] - person_bbox[1]
-            if p_w > 0 and (p_h / p_w) < 0.8:
-                # Too wide relative to height — more likely a lying/crouching pedestrian
-                continue
-
-            if helmet_model is not None and frame_bgr is not None:
-                cls_name, helm_conf = classify_helmet(person_bbox, frame_bgr, helmet_model)
-                if cls_name and "with" in cls_name.lower() and helm_conf >= 0.35:
-                    pass  # helmeted — no violation
-                elif cls_name and "without" in cls_name.lower() and helm_conf >= 0.35:
-                    violations.append({
-                        "type":        "Helmet Non-Compliance",
-                        "confidence":  round(helm_conf, 2),
-                        "bbox":        person_bbox,
-                        "track_id":    bike_tid,
-                        "vehicle_id":  bike_vid,
-                        "severity":    "HIGH" if helm_conf >= 0.55 else "MEDIUM",
-                        "description": f"Rider on {bike_vid} WITHOUT helmet (conf {helm_conf:.0%}).",
-                        "geo_features": geo,
-                    })
-                # else: inconclusive — do not flag; let the 2-sighting filter catch repeats
-            else:
+            cls_name, helm_conf = classify_helmet(person_bbox, frame_bgr, helmet_model)
+            checked = True
+            status = helmet_status(cls_name)
+            if status == "no_helmet" and helm_conf >= 0.20:
                 violations.append({
                     "type":        "Helmet Non-Compliance",
-                    "confidence":  round(min(bike_conf * 0.8, 0.70), 2),
-                    "bbox":        bike_bbox,
+                    "confidence":  round(helm_conf, 2),
+                    "bbox":        person_bbox,
                     "track_id":    bike_tid,
                     "vehicle_id":  bike_vid,
-                    "severity":    "MEDIUM",
-                    "description": f"Rider on {bike_vid} — helmet unverifiable (base model only).",
+                    "severity":    "HIGH" if helm_conf >= 0.45 else "MEDIUM",
+                    "description": f"Rider on {bike_vid} WITHOUT helmet (conf {helm_conf:.0%}).",
                     "geo_features": geo,
                 })
+            # status == "helmeted" or low-conf → no violation
+
+        if checked:
+            continue
+
+        # Strategy B: no separate person bbox — in CCTV/elevated angles the rider
+        # and bike are often merged. Crop the TOP 55% of the motorcycle bbox
+        # (where the rider's torso/head sits) and run helmet model directly.
+        x1, y1, x2, y2 = [int(c) for c in bike_bbox]
+        bh = y2 - y1
+        rider_y2 = y1 + max(int(bh * 0.55), 20)
+        bike_crop = frame_bgr[max(0, y1):rider_y2, max(0, x1):x2]
+        if bike_crop.size == 0 or min(bike_crop.shape[:2]) < 12:
+            continue
+        if min(bike_crop.shape[:2]) < 80:
+            scale = max(2, int(96 / max(min(bike_crop.shape[:2]), 1)))
+            bike_crop = cv2.resize(bike_crop, None, fx=scale, fy=scale,
+                                   interpolation=cv2.INTER_CUBIC)
+        res2  = helmet_model(bike_crop, conf=0.18, verbose=False)
+        boxes2 = res2[0].boxes
+        if not boxes2:
+            continue
+        names2 = res2[0].names
+        best2  = max(boxes2, key=lambda bx: float(bx.conf))
+        cls2, conf2 = names2[int(best2.cls)], float(best2.conf)
+        geo = extract_geometric_features(bike_bbox, img_shape)
+        if helmet_status(cls2) == "no_helmet" and conf2 >= 0.22:
+            violations.append({
+                "type":        "Helmet Non-Compliance",
+                "confidence":  round(conf2, 2),
+                "bbox":        bike_bbox,
+                "track_id":    bike_tid,
+                "vehicle_id":  bike_vid,
+                "severity":    "HIGH" if conf2 >= 0.45 else "MEDIUM",
+                "description": f"Rider on {bike_vid} WITHOUT helmet — detected on bike crop (conf {conf2:.0%}).",
+                "geo_features": geo,
+            })
 
     # ── 2. Triple Riding ──────────────────────────────────────────────────────
     for bike_bbox, bike_conf, bike_tid, bike_vid in motorcycles:
-        bw        = bike_bbox[2] - bike_bbox[0]
-        tight_tol = max(int(bw * 0.45), 30)
-        riding_persons = []
-        for p, _, _ in persons:
-            geo = extract_geometric_features(p, img_shape)
-            if person_on_motorcycle(p, bike_bbox, tolerance=tight_tol):
-                riding_persons.append(p)
+        riding_persons = [p for p, _, _ in persons
+                          if person_on_motorcycle(p, bike_bbox)]
         if len(riding_persons) >= 3:
             violations.append({
                 "type":        "Triple Riding",
@@ -443,11 +470,11 @@ def detect_violations(
             v_crop = frame_bgr[max(0, y1):y2, max(0, x1):x2]
             if v_crop.size == 0 or v_crop.shape[0] < 40 or v_crop.shape[1] < 40:
                 continue
-            ws_res = wrongside_model(v_crop, conf=0.20, verbose=False)
+            ws_res = wrongside_model(v_crop, conf=0.40, verbose=False)
             for r in ws_res[0].boxes:
                 cls_name = ws_res[0].names[int(r.cls)]
                 ws_conf  = float(r.conf)
-                if "wrong" in cls_name.lower() and ws_conf >= 0.20:
+                if "wrong" in cls_name.lower() and ws_conf >= 0.40:
                     key = vv or (tuple(int(c) // 40 for c in vb))
                     if key not in seen_ws:
                         seen_ws.add(key)

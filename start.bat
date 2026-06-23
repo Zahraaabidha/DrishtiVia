@@ -1,13 +1,13 @@
 @echo off
-echo Starting ViolaVision 2.0...
+echo Starting DrishtiVia 2.0...
 echo.
 
 :: Start FastAPI backend
-start "ViolaVision API" cmd /k "cd /d %~dp0 && python -m uvicorn api:app --reload --port 8000"
+start "DrishtiVia API" cmd /k "cd /d %~dp0 && python -m uvicorn api:app --reload --port 8000"
 
 :: Wait a moment then start React frontend
 timeout /t 2 /nobreak >nul
-start "ViolaVision UI" cmd /k "cd /d %~dp0frontend && npm run dev"
+start "DrishtiVia UI" cmd /k "cd /d %~dp0frontend && npm run dev"
 
 echo.
 echo Both servers starting...

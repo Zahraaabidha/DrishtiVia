@@ -1,6 +1,6 @@
 ﻿import { useRef, useState, useCallback, useEffect } from "react";
 import {
-  detectImage, uploadVideoForStream, videoStreamUrl,
+  detectImage, uploadVideoForStream, videoStreamUrl, liveStreamUrl, saveViolation, snapshotUrl, postAction,
   type DetectImageResult, type DetectionViolation, type DetectOptions
 } from "../api/client";
 
@@ -32,45 +32,147 @@ const FLOW_DIRS   = ["Left -> Right", "Right -> Left"];
 
 type Mode = "image" | "video" | "stream";
 
-function ViolationCard({ v, flash }: { v: DetectionViolation; flash?: boolean }) {
-  const [open, setOpen] = useState(false);
+function ViolationModal({ v, onClose }: { v: DetectionViolation; onClose: () => void }) {
+  const [action, setAction] = useState<string | null>(null);
+
+  const doAction = async (act: string) => {
+    if (!v.db_id) return;
+    await postAction(v.db_id, act).catch(() => {});
+    setAction(act);
+  };
+
   return (
-    <div className={`rounded-[4px] border p-3.5 cursor-pointer hover:shadow-sm transition-all ${
-      flash ? "animate-pulse" : ""
-    } ${
-      v.severity === "CRITICAL" ? "border-red-200 bg-red-50" :
-      v.severity === "HIGH"     ? "border-orange-200 bg-orange-50" :
-      v.severity === "MEDIUM"   ? "border-yellow-100 bg-yellow-50" : "border-neutral-100 bg-white"
-    }`} onClick={() => setOpen(o => !o)}>
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2.5">
-          <span className={`text-[10px] font-bold px-2.5 py-0.5 rounded-full ${SEVERITY_COLOR[v.severity] ?? "bg-neutral-100 text-neutral-600"}`}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-[2px]"
+      onClick={onClose}>
+      <div className="bg-white rounded-[6px] shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto"
+        onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-6 pt-5 pb-3 border-b border-neutral-100">
+          <div>
+            <p className="text-[10px] font-bold tracking-[0.14em] uppercase text-neutral-400">
+              {v.db_id ? `Violation #${v.db_id}` : "Live Detection"}
+            </p>
+            <h2 className="text-[18px] font-bold text-neutral-900 mt-0.5">{v.type}</h2>
+          </div>
+          <button onClick={onClose}
+            className="w-8 h-8 rounded-full border border-neutral-200 flex items-center justify-center text-neutral-500 hover:bg-neutral-50">
+            ×
+          </button>
+        </div>
+
+        {/* Evidence snapshots */}
+        {v.evidence_hash ? (
+          <div className="grid grid-cols-2 gap-3 p-6 pb-4">
+            <div>
+              <p className="text-[10px] font-bold tracking-widest uppercase text-neutral-400 mb-2">Full Frame</p>
+              <img src={snapshotUrl(v.evidence_hash, "full")} alt="full frame"
+                className="w-full rounded border border-neutral-100 object-cover"
+                onError={e => { (e.target as HTMLImageElement).style.display = "none"; }}/>
+            </div>
+            <div>
+              <p className="text-[10px] font-bold tracking-widest uppercase text-neutral-400 mb-2">Vehicle Crop</p>
+              <img src={snapshotUrl(v.evidence_hash, "crop")} alt="vehicle crop"
+                className="w-full rounded border border-neutral-100 object-cover"
+                onError={e => { (e.target as HTMLImageElement).style.display = "none"; }}/>
+            </div>
+          </div>
+        ) : (
+          <div className="px-6 pt-5 pb-2">
+            <p className="text-[11px] text-amber-600 bg-amber-50 rounded px-3 py-2">
+              Evidence snapshots not yet saved — violation was detected but not confirmed to DB.
+            </p>
+          </div>
+        )}
+
+        {/* Metadata grid */}
+        <div className="grid grid-cols-3 gap-2 px-6 pb-4">
+          {[
+            ["Violation Type", v.type],
+            ["Severity",       v.severity],
+            ["Confidence",     `${(v.confidence * 100).toFixed(1)}%`],
+            ["Vehicle ID",     v.vehicle_id || "—"],
+            ["Sightings",      v.sightings !== undefined ? `${v.sightings}×` : "—"],
+            ["Frame",          v.frame !== undefined ? `f${v.frame}` : "—"],
+            ["Evidence Hash",  v.evidence_hash ?? "Not saved"],
+          ].map(([k, val]) => (
+            <div key={k} className="bg-neutral-50 rounded-[3px] p-3 col-span-1 last:col-span-3">
+              <p className="text-[9px] font-bold tracking-widest uppercase text-neutral-400 mb-0.5">{k}</p>
+              <p className="text-[11px] font-medium text-neutral-900 break-all">{val}</p>
+            </div>
+          ))}
+        </div>
+
+        {v.description && (
+          <p className="px-6 pb-4 text-[11px] text-neutral-500 italic">{v.description}</p>
+        )}
+
+        {/* Severity badge */}
+        <div className="px-6 pb-4 flex gap-2 flex-wrap items-center">
+          <span className={`text-[11px] font-bold px-3 py-1 rounded-full ${SEVERITY_COLOR[v.severity] ?? "bg-neutral-100 text-neutral-600"}`}>
             {v.severity}
           </span>
-          <span className="text-[13px] font-semibold text-neutral-900">{v.type}</span>
+          {v.evidence_hash && (
+            <span className="text-[10px] font-semibold text-green-700 bg-green-50 px-2.5 py-1 rounded-full">✓ Saved to DB</span>
+          )}
         </div>
-        <div className="flex items-center gap-2">
-          <span className="text-[13px] font-bold text-neutral-700">{(v.confidence * 100).toFixed(1)}%</span>
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#999" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
-            className={`transition-transform ${open ? "rotate-180" : ""}`}>
-            <polyline points="6 9 12 15 18 9"/>
-          </svg>
-        </div>
+
+        {/* Actions — only if saved to DB */}
+        {v.db_id && (
+          <div className="flex items-center gap-3 px-6 pb-5 border-t border-neutral-100 pt-4">
+            {action ? (
+              <p className="text-[12px] font-semibold text-green-700 bg-green-50 px-4 py-2 rounded-full">
+                ✓ Marked as {action}
+              </p>
+            ) : (
+              <>
+                <button onClick={() => doAction("CONFIRMED")}
+                  className="px-5 py-2.5 bg-green-600 text-white text-[12px] font-semibold rounded hover:bg-green-700 transition-colors">
+                  ✓ Confirm
+                </button>
+                <button onClick={() => doAction("DISMISSED")}
+                  className="px-5 py-2.5 border border-neutral-300 text-neutral-700 text-[12px] font-semibold rounded hover:bg-neutral-50 transition-colors">
+                  ✕ Dismiss
+                </button>
+                <button onClick={() => doAction("ESCALATED")}
+                  className="px-5 py-2.5 bg-amber-500 text-white text-[12px] font-semibold rounded hover:bg-amber-600 transition-colors">
+                  ↑ Escalate
+                </button>
+              </>
+            )}
+          </div>
+        )}
       </div>
-      {open && (
-        <div className="mt-3 flex flex-col gap-1.5 border-t border-black/5 pt-3">
-          {v.vehicle_id && <p className="text-[11px] text-neutral-600"><span className="font-semibold">Vehicle ID:</span> <span className="font-mono bg-neutral-100 px-1.5 py-0.5 rounded text-neutral-800">{v.vehicle_id}</span></p>}
-          {v.vehicle_category && <p className="text-[11px] text-neutral-600"><span className="font-semibold">Vehicle:</span> {v.vehicle_category}</p>}
-          {v.track_id !== undefined && v.track_id !== null && <p className="text-[11px] text-neutral-600"><span className="font-semibold">Track ID:</span> {v.track_id}</p>}
-          {v.sightings !== undefined && <p className="text-[11px] text-neutral-600"><span className="font-semibold">Sightings:</span> {v.sightings}×</p>}
-          {v.frame !== undefined && <p className="text-[11px] text-neutral-600"><span className="font-semibold">Frame:</span> {v.frame}</p>}
-          {v.bbox && <p className="text-[11px] text-neutral-600"><span className="font-semibold">BBox:</span> [{v.bbox.map(n => Math.round(n)).join(", ")}]</p>}
-          {v.description && <p className="text-[11px] text-neutral-500 italic">{v.description}</p>}
-          {v.note && <p className="text-[10px] text-amber-600 bg-amber-50 rounded-[8px] px-2 py-1">{v.note}</p>}
-          {ACCURACY_LABELS[v.type] && <p className="text-[10px] text-neutral-400 border-t border-black/5 pt-1.5 mt-1">{ACCURACY_LABELS[v.type]}</p>}
-        </div>
-      )}
     </div>
+  );
+}
+
+function ViolationCard({ v, flash }: { v: DetectionViolation; flash?: boolean }) {
+  const [showModal, setShowModal] = useState(false);
+  return (
+    <>
+      <div className={`rounded-[4px] border p-3.5 cursor-pointer hover:shadow-sm transition-all ${
+        flash ? "animate-pulse" : ""
+      } ${
+        v.severity === "CRITICAL" ? "border-red-200 bg-red-50" :
+        v.severity === "HIGH"     ? "border-orange-200 bg-orange-50" :
+        v.severity === "MEDIUM"   ? "border-yellow-100 bg-yellow-50" : "border-neutral-100 bg-white"
+      }`} onClick={() => setShowModal(true)}>
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2.5">
+            <span className={`text-[10px] font-bold px-2.5 py-0.5 rounded-full ${SEVERITY_COLOR[v.severity] ?? "bg-neutral-100 text-neutral-600"}`}>
+              {v.severity}
+            </span>
+            <span className="text-[13px] font-semibold text-neutral-900">{v.type}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-[13px] font-bold text-neutral-700">{(v.confidence * 100).toFixed(1)}%</span>
+            {v.evidence_hash && <span className="text-[9px] text-green-600 font-semibold">✓ Saved</span>}
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#999" strokeWidth="2"><path d="M9 18l6-6-6-6"/></svg>
+          </div>
+        </div>
+        <p className="text-[10px] text-neutral-400 mt-1">Click to view evidence &amp; details</p>
+      </div>
+      {showModal && <ViolationModal v={v} onClose={() => setShowModal(false)} />}
+    </>
   );
 }
 
@@ -120,10 +222,11 @@ export default function LiveDetectPage() {
     setCanvasReady(false); setVehicleLog({});
   }
 
-  const detectOpts: DetectOptions & { frameSkip: number; maxSeconds: number } = {
+  const detectOpts: DetectOptions & { frameSkip: number; maxSeconds: number; cameraId: string } = {
     stopLineY: stopLine, signalRed, stoplineEnabled,
     sceneType, wrongSidePresent, flowDirection,
     frameSkip, maxSeconds: maxSecs,
+    cameraId: camera,
   };
 
   // Draw a base64 JPEG onto the canvas
@@ -165,6 +268,12 @@ export default function LiveDetectPage() {
     try {
       const r = await detectImage(imgFile, detectOpts);
       setImgResult(r);
+      // Save HIGH/CRITICAL violations from image to DB
+      for (const v of r.violations) {
+        if (v.severity === "HIGH" || v.severity === "CRITICAL") {
+          saveViolation(v, camera, r.plate).catch(() => {});
+        }
+      }
     } catch (e: any) {
       setError(e?.response?.data?.detail ?? e?.message ?? "Detection failed");
     } finally { setLoading(false); }
@@ -206,7 +315,7 @@ export default function LiveDetectPage() {
           setVidDone(true);
           setLoading(false);
           setProgress(100);
-          setProgressMsg(`Done — ${data.total_frames} frames, ${data.frames_analysed} analysed`);
+          setProgressMsg(`Analysis complete · ${data.count ?? 0} violations detected`);
           es.close();
           return;
         }
@@ -218,11 +327,13 @@ export default function LiveDetectPage() {
         setProgress(data.progress ?? 0);
         setProgressMsg(`Frame ${data.frame} / ${data.total} · ${data.confirmed_viols?.length ?? 0} confirmed violations`);
 
-        // New confirmed violations — flash them
+        // New confirmed violations — flash them and save to DB
         if (data.new_confirmed?.length) {
           const newTypes: string[] = data.new_confirmed.map((v: any) => v.type);
           setNewFlash(newTypes);
           setTimeout(() => setNewFlash([]), 1500);
+          // Violations are persisted server-side (SQLite + evidence snapshots)
+          // inside the stream loop — no client save needed.
         }
 
         // Update live violation list
@@ -440,17 +551,70 @@ export default function LiveDetectPage() {
           )}
 
           {mode === "stream" && (
-            <div className="bg-white rounded-[4px] p-4 border border-neutral-100 shadow-sm flex flex-col gap-3">
-              <p className="text-[10px] font-bold tracking-[0.16em] uppercase text-neutral-400">Live Stream URL</p>
-              <input type="text" placeholder="https://youtube.com/watch?v=… or rtsp://…"
-                value={streamUrl} onChange={e => setStreamUrl(e.target.value)}
-                className="text-[12px] border border-neutral-200 rounded-[3px] px-3 py-2.5 focus:outline-none focus:border-neutral-400 font-mono"/>
-              <div className="bg-amber-50 border border-amber-100 rounded-[3px] p-3">
-                <p className="text-[11px] font-semibold text-amber-800 mb-1">YouTube stream setup</p>
-                <p className="text-[10px] text-amber-700 font-mono">yt-dlp -f best -g "YOUTUBE_URL"</p>
-                <p className="text-[10px] text-amber-600 mt-1">Copy the resolved .m3u8 URL, switch to Video mode, upload or stream via RTSP.</p>
+            <>
+              <div className="bg-white rounded-[4px] p-4 border border-neutral-100 shadow-sm flex flex-col gap-3">
+                <p className="text-[10px] font-bold tracking-[0.16em] uppercase text-neutral-400">Live Stream URL</p>
+                <input type="text" placeholder="https://youtube.com/watch?v=… or rtsp://…"
+                  value={streamUrl} onChange={e => setStreamUrl(e.target.value)}
+                  className="text-[12px] border border-neutral-200 rounded-[3px] px-3 py-2.5 focus:outline-none focus:border-neutral-400 font-mono"/>
+                <div className="bg-blue-50 border border-blue-100 rounded-[3px] p-3">
+                  <p className="text-[11px] font-semibold text-blue-800 mb-1">Supported sources</p>
+                  <ul className="text-[10px] text-blue-700 space-y-0.5 list-disc list-inside">
+                    <li>YouTube live streams — paste the watch URL directly</li>
+                    <li>RTSP camera feeds — rtsp://192.168.x.x/stream</li>
+                    <li>HLS / .m3u8 URLs from any source</li>
+                  </ul>
+                  <p className="text-[10px] text-blue-500 mt-2">Requires <code className="bg-blue-100 px-1 rounded">yt-dlp</code> installed on the server for YouTube.</p>
+                </div>
+                <div>
+                  <label className="text-[11px] text-neutral-500">Frame skip: <strong>{frameSkip}</strong></label>
+                  <input type="range" min={1} max={10} value={frameSkip} onChange={e => setFrameSkip(+e.target.value)} className="w-full accent-neutral-900 mt-1"/>
+                </div>
+                <div>
+                  <label className="text-[11px] text-neutral-500">Analyse duration: <strong>{maxSecs}s</strong></label>
+                  <input type="range" min={10} max={120} value={maxSecs} onChange={e => setMaxSecs(+e.target.value)} className="w-full accent-neutral-900 mt-1"/>
+                </div>
               </div>
-            </div>
+              <button
+                onClick={() => {
+                  if (loading) { stopStream(); return; }
+                  if (!streamUrl.trim()) return;
+                  stopStream(); reset();
+                  const isYT = streamUrl.includes("youtube.com") || streamUrl.includes("youtu.be");
+                  setLoading(true); setCanvasReady(true);
+                  setProgressMsg(isYT ? "Downloading stream via yt-dlp (up to 60s)…" : "Connecting to stream…");
+                  const url = liveStreamUrl(streamUrl.trim(), detectOpts);
+                  const es  = new EventSource(url);
+                  esRef.current = es;
+                  es.onmessage = (evt) => {
+                    try {
+                      const data = JSON.parse(evt.data);
+                      if (data.error) { setError(data.error); setLoading(false); es.close(); return; }
+                      if (data.status) { setProgressMsg(data.msg ?? "Preparing…"); return; }
+                      if (data.done) { setLoading(false); setProgressMsg(`Stream ended · ${liveViols.length} violation${liveViols.length !== 1 ? "s" : ""} confirmed`); es.close(); return; }
+                      if (data.frame_b64) drawFrame(data.frame_b64);
+                      setProgress(data.progress ?? 0);
+                      setProgressMsg(`Analysing · ${data.confirmed_viols?.length ?? 0} violations confirmed so far`);
+                      if (data.new_confirmed?.length) {
+                        setNewFlash(data.new_confirmed.map((v: DetectionViolation) => v.type));
+                        setTimeout(() => setNewFlash([]), 1500);
+                        // Persisted server-side (SQLite + evidence snapshots).
+                      }
+                      if (data.confirmed_viols?.length) {
+                        setLiveViols([...data.confirmed_viols].sort((a: DetectionViolation, b: DetectionViolation) =>
+                          (SEVERITY_PRIORITY[b.severity] ?? 0) - (SEVERITY_PRIORITY[a.severity] ?? 0)));
+                      }
+                    } catch { /* ignore */ }
+                  };
+                  es.onerror = () => { setError("Stream lost or URL unreachable."); setLoading(false); es.close(); };
+                }}
+                disabled={!streamUrl.trim() && !loading}
+                className={`w-full py-3 rounded-full text-white text-[13px] font-semibold transition-all disabled:opacity-40 disabled:cursor-not-allowed ${
+                  loading ? "bg-red-600 hover:bg-red-700" : "bg-neutral-900 hover:bg-neutral-700"
+                }`}>
+                {loading ? "⏹ Stop Stream" : "📡 Start Live Analysis"}
+              </button>
+            </>
           )}
 
           {error && (
@@ -494,13 +658,13 @@ export default function LiveDetectPage() {
             </>
           )}
 
-          {/* Upload progress (before SSE canvas) */}
-          {mode === "video" && loading && !canvasReady && (
+          {/* Upload progress / connecting (before canvas is ready) */}
+          {(mode === "video" || mode === "stream") && loading && !canvasReady && (
             <div className="bg-white rounded-[4px] p-5 border border-neutral-100 shadow-sm flex flex-col items-center justify-center min-h-[200px] gap-4">
               <div className="w-full">
                 <div className="flex items-center justify-between mb-2">
-                  <p className="text-[12px] font-medium text-neutral-700">Uploading video to server…</p>
-                  <span className="text-[12px] font-bold text-neutral-900">{uploadPct}%</span>
+                  <p className="text-[12px] font-medium text-neutral-700">{mode === "stream" ? "Resolving stream URL…" : "Uploading video to server…"}</p>
+                  <span className="text-[12px] font-bold text-neutral-900">{mode === "stream" ? "" : `${uploadPct}%`}</span>
                 </div>
                 <div className="h-2 bg-neutral-100 rounded-full overflow-hidden">
                   <div className="h-full bg-neutral-900 rounded-full transition-all duration-150" style={{ width: `${uploadPct}%` }}/>
@@ -512,19 +676,31 @@ export default function LiveDetectPage() {
             </div>
           )}
 
-          {/* VIDEO live stream canvas */}
-          {mode === "video" && canvasReady && (
+          {/* VIDEO / STREAM live canvas */}
+          {(mode === "video" || mode === "stream") && canvasReady && (
             <>
-              {/* Progress bar */}
-              <div className="bg-white rounded-[4px] p-4 border border-neutral-100 shadow-sm">
-                <div className="flex items-center justify-between mb-2">
-                  <p className="text-[11px] text-neutral-500">{progressMsg || "Initialising…"}</p>
-                  <span className="text-[11px] font-bold text-neutral-700">{progress}%</span>
+              {/* Progress bar — video only. Stream has no end so no % bar. */}
+              {mode === "video" ? (
+                <div className="bg-white rounded-[4px] p-4 border border-neutral-100 shadow-sm">
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="text-[11px] text-neutral-500">{progressMsg || "Initialising…"}</p>
+                    <span className="text-[11px] font-bold text-neutral-700">{progress}%</span>
+                  </div>
+                  <div className="h-1.5 bg-neutral-100 rounded-full overflow-hidden">
+                    <div className="h-full bg-neutral-900 rounded-full transition-all duration-300" style={{ width: `${progress}%` }}/>
+                  </div>
                 </div>
-                <div className="h-1.5 bg-neutral-100 rounded-full overflow-hidden">
-                  <div className="h-full bg-neutral-900 rounded-full transition-all duration-300" style={{ width: `${progress}%` }}/>
+              ) : (
+                <div className="bg-white rounded-[4px] px-4 py-3 border border-neutral-100 shadow-sm flex items-center gap-3">
+                  <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse shrink-0"/>
+                  <p className="text-[12px] text-neutral-600 font-medium">
+                    {progressMsg || "Connected — analysing live frames…"}
+                  </p>
+                  <span className="ml-auto text-[11px] font-semibold text-neutral-400">
+                    {liveViols.length > 0 ? `${liveViols.length} violation${liveViols.length > 1 ? "s" : ""} confirmed` : "Monitoring…"}
+                  </span>
                 </div>
-              </div>
+              )}
 
               {/* Live canvas with fullscreen */}
               <div ref={canvasWrap} className="relative bg-neutral-900 rounded-[4px] overflow-hidden shadow-sm"
@@ -554,7 +730,7 @@ export default function LiveDetectPage() {
                   </div>
                 )}
 
-                {vidDone && (
+                {vidDone && mode === "video" && (
                   <div className="absolute top-3 left-3 bg-green-600 text-white text-[10px] font-bold px-2.5 py-1 rounded-full">
                     ✓ ANALYSIS COMPLETE
                   </div>

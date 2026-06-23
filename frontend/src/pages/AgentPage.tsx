@@ -1,11 +1,11 @@
 ﻿import { useState, useRef, useEffect } from "react";
-import { agentQuery } from "../api/client";
 
 interface Message {
   role: "user" | "agent";
   text: string;
   ts: Date;
   source?: string;
+  id?: number;
 }
 
 const SUGGESTIONS = [
@@ -83,14 +83,45 @@ export default function AgentPage() {
     setInput("");
     setMessages(prev => [...prev, { role: "user", text: question, ts: new Date() }]);
     setLoading(true);
-    try {
-      const res = await agentQuery(question);
-      setMessages(prev => [...prev, { role: "agent", text: res.answer, ts: new Date(), source: res.source }]);
-    } catch {
-      setMessages(prev => [...prev, { role: "agent", text: "Sorry, I couldn't reach the backend. Make sure the FastAPI server is running on port 8000.", ts: new Date() }]);
-    } finally {
+
+    // Placeholder agent message that we'll stream tokens into
+    const agentMsgId = Date.now();
+    setMessages(prev => [...prev, { role: "agent", text: "", ts: new Date(), source: undefined, id: agentMsgId }]);
+
+    const params = new URLSearchParams({ question });
+    const es = new EventSource(`/api/agent/stream?${params}`);
+    let source: string | undefined;
+
+    es.onmessage = (evt) => {
+      try {
+        const data = JSON.parse(evt.data);
+        if (data.source && !source) source = data.source;
+        if (data.token) {
+          setMessages(prev => prev.map(m =>
+            (m as any).id === agentMsgId
+              ? { ...m, text: m.text + data.token, source: source }
+              : m
+          ));
+        }
+        if (data.done) {
+          es.close();
+          setLoading(false);
+          // Ensure source is set on final message
+          setMessages(prev => prev.map(m =>
+            (m as any).id === agentMsgId ? { ...m, source: data.source ?? source } : m
+          ));
+        }
+      } catch { /* ignore */ }
+    };
+    es.onerror = () => {
+      es.close();
       setLoading(false);
-    }
+      setMessages(prev => prev.map(m =>
+        (m as any).id === agentMsgId && m.text === ""
+          ? { ...m, text: "Sorry, couldn't reach the backend." }
+          : m
+      ));
+    };
   }
 
   return (
@@ -147,18 +178,21 @@ export default function AgentPage() {
           {/* Messages */}
           <div className="flex-1 overflow-y-auto px-5 py-5 flex flex-col gap-4">
             {messages.map((msg, i) => <AgentBubble key={i} msg={msg}/>)}
-            {loading && (
+            {loading && messages[messages.length - 1]?.text === "" && (
               <div className="flex gap-3">
                 <div className="w-8 h-8 rounded-full bg-neutral-900 flex items-center justify-center shrink-0">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                     <circle cx="12" cy="8" r="4"/><path d="M6 20v-2a6 6 0 0 1 12 0v2"/>
                   </svg>
                 </div>
-                <div className="bg-white border border-neutral-100 rounded-[4px] px-4 py-3 flex items-center gap-1.5">
-                  {[0, 1, 2].map(i => (
-                    <div key={i} className="w-1.5 h-1.5 rounded-full bg-neutral-400 animate-bounce"
-                      style={{ animationDelay: `${i * 0.15}s` }}/>
-                  ))}
+                <div className="bg-white border border-neutral-100 rounded-[4px] px-4 py-3 flex items-center gap-2">
+                  <div className="flex gap-1">
+                    {[0, 1, 2].map(i => (
+                      <div key={i} className="w-1.5 h-1.5 rounded-full bg-neutral-400 animate-bounce"
+                        style={{ animationDelay: `${i * 0.15}s` }}/>
+                    ))}
+                  </div>
+                  <span className="text-[10px] text-neutral-400">Consulting AI model…</span>
                 </div>
               </div>
             )}
