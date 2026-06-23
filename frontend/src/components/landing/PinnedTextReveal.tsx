@@ -37,7 +37,6 @@ export default function PinnedTextReveal() {
             scrub: 1.5,
             pin: true,
             anticipatePin: 1,
-            pinSpacing: false,
           },
         }
       )
