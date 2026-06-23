@@ -44,6 +44,8 @@ export interface DetectionViolation {
   note?: string;
   frame?: number;
   sightings?: number;
+  evidence_hash?: string;
+  db_id?: number;
 }
 
 export interface DetectImageResult {
@@ -144,6 +146,17 @@ export const searchViolations = (q: string, limit = 50) =>
 export const agentQuery = (question: string) =>
   api.post<{ answer: string; question: string; source?: string }>("/agent", { question }).then(r => r.data);
 export const reportUrl = (id: number) => `/api/report/${id}`;
+export const saveViolation = (v: DetectionViolation, camera_id: string, plate: string = "UNREADABLE") =>
+  api.post("/violations/save", {
+    violation_type: v.type,
+    confidence:     v.confidence,
+    severity:       v.severity,
+    camera_id,
+    plate_number:   plate,
+    vehicle_id:     v.vehicle_id ?? "",
+    description:    v.description ?? "",
+    bbox:           v.bbox ?? [],
+  }).then(r => r.data);
 export const uploadVideoForStream = (
   file: File,
   onProgress?: (pct: number) => void
@@ -168,9 +181,28 @@ export const uploadVideoForStream = (
     xhr.onerror = () => reject(new Error("Network error during upload"));
     xhr.send(fd);
   });
+export const liveStreamUrl = (
+  url: string,
+  opts: DetectOptions & { frameSkip?: number; maxSeconds?: number; cameraId?: string }
+) => {
+  const p = new URLSearchParams({
+    url,
+    stop_line_y:        String(opts.stopLineY ?? 400),
+    frame_skip:         String(opts.frameSkip ?? 6),
+    max_seconds:        String(opts.maxSeconds ?? 60),
+    signal_red:         String(opts.signalRed ?? false),
+    stopline_enabled:   String(opts.stoplineEnabled ?? false),
+    scene_type:         opts.sceneType ?? "Junction",
+    wrong_side_present: String(opts.wrongSidePresent ?? false),
+    flow_direction:     opts.flowDirection ?? "Left -> Right",
+    camera_id:          opts.cameraId ?? "live_stream",
+  });
+  return `/api/detect/stream/live?${p}`;
+};
+
 export const videoStreamUrl = (
   sessionId: string,
-  opts: DetectOptions & { frameSkip?: number; maxSeconds?: number }
+  opts: DetectOptions & { frameSkip?: number; maxSeconds?: number; cameraId?: string }
 ) => {
   const p = new URLSearchParams({
     stop_line_y:        String(opts.stopLineY ?? 400),
@@ -181,6 +213,7 @@ export const videoStreamUrl = (
     scene_type:         opts.sceneType ?? "Junction",
     wrong_side_present: String(opts.wrongSidePresent ?? false),
     flow_direction:     opts.flowDirection ?? "Left -> Right",
+    camera_id:          opts.cameraId ?? "live_upload",
   });
   return `/api/detect/video/stream/${sessionId}?${p}`;
 };

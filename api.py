@@ -42,7 +42,7 @@ DB_PATH  = Path(os.getenv("DB_PATH",  str(BASE_DIR / "evidence_store" / "violati
 SNAP_DIR = Path(os.getenv("SNAP_DIR", str(BASE_DIR / "evidence_store" / "snapshots")))
 SNAP_DIR.mkdir(parents=True, exist_ok=True)
 
-HELMET_PATH    = Path(os.getenv("HELMET_MODEL",    str(BASE_DIR / "runs/detect/runs/helmet_train/violavision_v1/weights/best.pt")))
+HELMET_PATH    = Path(os.getenv("HELMET_MODEL",    str(BASE_DIR / "runs/detect/runs/helmet_train_v2/violavision_v1/weights/best.pt")))
 SEATBELT_PATH  = Path(os.getenv("SEATBELT_MODEL",  str(BASE_DIR / "runs/detect/runs/seatbelt_train/violavision_seatbelt_v1-2/weights/best.pt")))
 WRONGSIDE_PATH = Path(os.getenv("WRONGSIDE_MODEL", str(BASE_DIR / "runs/detect/runs/wrongside_train/violavision_wrongside_v1/weights/best.pt")))
 
@@ -368,6 +368,117 @@ def search(q: str = Query(""), limit: int = 50):
     con.close()
     return {"results": rows, "count": len(rows)}
 
+# ── Save detected violations to DB ───────────────────────────────────────────
+import hashlib
+
+class SaveViolationBody(BaseModel):
+    violation_type: str
+    confidence:     float
+    severity:       str
+    camera_id:      str = "Unknown"
+    plate_number:   str = "UNREADABLE"
+    vehicle_id:     str = ""
+    description:    str = ""
+    bbox:           list = []
+
+@app.post("/api/violations/save", dependencies=[Depends(require_auth)])
+def save_violation(body: SaveViolationBody):
+    """Save a single detected violation from the Live Detect page into SQLite."""
+    ts      = time.time()
+    raw     = f"{body.violation_type}{body.camera_id}{body.plate_number}{ts}"
+    ev_hash = hashlib.sha256(raw.encode()).hexdigest()
+
+    PRIORITY_MAP = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+    priority_score = round(
+        PRIORITY_MAP.get(body.severity.upper(), 1) * body.confidence * 10, 2
+    )
+
+    con = _db()
+    _ensure_schema(con)
+    con.execute("""
+        INSERT INTO violations
+            (timestamp, plate_number, violation_type, confidence, priority_level,
+             priority_score, camera_id, evidence_hash, description)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (ts, body.plate_number, body.violation_type, body.confidence,
+          body.severity.upper(), priority_score, body.camera_id, ev_hash, body.description))
+    con.commit()
+    new_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+    con.close()
+    return {"ok": True, "id": new_id, "evidence_hash": ev_hash}
+
+
+def _ensure_schema(con):
+    """Create table and add any missing columns without dropping existing data."""
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS violations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL, plate_number TEXT, violation_type TEXT,
+            confidence REAL, priority_score REAL, priority_level TEXT,
+            evidence_hash TEXT, camera_id TEXT, operator_action TEXT,
+            operator_timestamp REAL, dismissal_reason TEXT, snapshot_path TEXT,
+            description TEXT, vehicle_id TEXT, bbox TEXT
+        )
+    """)
+    cur = con.execute("PRAGMA table_info(violations)")
+    existing = {r[1] for r in cur.fetchall()}
+    for col, typedef in [
+        ("description",      "TEXT"),
+        ("vehicle_id",       "TEXT"),
+        ("bbox",             "TEXT"),
+        ("dismissal_reason", "TEXT"),
+        ("operator_timestamp", "REAL"),
+    ]:
+        if col not in existing:
+            con.execute(f"ALTER TABLE violations ADD COLUMN {col} {typedef}")
+
+
+def _persist_violation(viol: dict, frame_bgr, camera_id: str,
+                       plate: str = "UNREADABLE") -> tuple:
+    """
+    Save one confirmed violation + evidence snapshots (full frame + vehicle
+    crop) to SQLite. Returns the evidence hash.
+    """
+    ts      = time.time()
+    vtype   = viol.get("type", "Unknown")
+    conf    = float(viol.get("confidence", 0) or 0)
+    sev     = str(viol.get("severity", "MEDIUM")).upper()
+    ev_hash = hashlib.sha256(f"{vtype}{camera_id}{plate}{ts}".encode()).hexdigest()
+    h16     = ev_hash[:16]
+
+    snap_full = SNAP_DIR / f"{h16}_full.jpg"
+    snap_crop = SNAP_DIR / f"{h16}_crop.jpg"
+    try:
+        if frame_bgr is not None:
+            cv2.imwrite(str(snap_full), frame_bgr)
+            bbox = viol.get("bbox")
+            if bbox and len(bbox) == 4:
+                x1, y1, x2, y2 = [max(0, int(c)) for c in bbox]
+                crop = frame_bgr[y1:y2, x1:x2]
+                if crop.size > 0:
+                    cv2.imwrite(str(snap_crop), crop)
+    except Exception:
+        pass
+
+    PRIORITY_MAP   = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+    priority_score = round(PRIORITY_MAP.get(sev, 1) * conf * 10, 2)
+
+    con = _db()
+    _ensure_schema(con)
+    con.execute("""
+        INSERT INTO violations
+            (timestamp, plate_number, violation_type, confidence,
+             priority_level, priority_score, camera_id, evidence_hash,
+             snapshot_path, description, vehicle_id, bbox)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (ts, plate, vtype, conf, sev, priority_score, camera_id, ev_hash,
+          str(snap_full), viol.get("description", ""),
+          viol.get("vehicle_id", ""), str(viol.get("bbox", []))))
+    con.commit()
+    db_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+    con.close()
+    return ev_hash, db_id
+
 # ── Violation action ──────────────────────────────────────────────────────────
 class ActionBody(BaseModel):
     action: str
@@ -507,19 +618,21 @@ async def detect_video(
             for v in viols:
                 v["frame"] = frame_count
                 vtype = v.get("type", "")
+                vid   = v.get("vehicle_id", "unknown")
                 conf  = v.get("confidence", 0)
+                tkey  = f"{vtype}::{vid}"
 
-                temporal_counts[vtype] += 1
-                if vtype not in temporal_best or conf > temporal_best[vtype].get("confidence", 0):
-                    temporal_best[vtype] = v
+                temporal_counts[tkey] += 1
+                if tkey not in temporal_best or conf > temporal_best[tkey].get("confidence", 0):
+                    temporal_best[tkey] = v
 
-                if vtype not in confirmed_types:
-                    if temporal_counts[vtype] >= 2 or conf >= 0.55:
+                if tkey not in confirmed_types:
+                    if temporal_counts[tkey] >= 2 or conf >= 0.38:
                         c = _clean_viols([v])[0]
                         c["confirmed_at_frame"] = frame_count
-                        c["sightings"] = temporal_counts[vtype]
+                        c["sightings"] = temporal_counts[tkey]
                         confirmed_viols.append(c)
-                        confirmed_types.add(vtype)
+                        confirmed_types.add(tkey)
 
     finally:
         cap.release()
@@ -633,6 +746,243 @@ def knowledge_graph(limit: int = 80):
     con.close()
     return {"edges": edges, "repeat_offenders": offenders, "hotspots": hotspots}
 
+# ── URL / YouTube live stream → SSE ──────────────────────────────────────────
+import subprocess, shutil
+
+def _get_ffmpeg() -> str:
+    """Return path to ffmpeg — prefer system install, fall back to imageio-ffmpeg bundle."""
+    p = shutil.which("ffmpeg")
+    if p:
+        return p
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        raise HTTPException(500, "ffmpeg not found. Run: pip install imageio-ffmpeg")
+
+
+def _open_stream_cap(url: str):
+    """
+    Open a VideoCapture for any URL.
+    For YouTube/youtu.be: resolves via yt-dlp (android client, no JS needed)
+    then pipes through ffmpeg → OpenCV in real time so nothing is downloaded.
+    For RTSP/HLS: opens directly with OpenCV.
+    Returns (cap, cleanup_fn).
+    """
+    ytdlp = shutil.which("yt-dlp")
+    is_youtube = "youtube.com" in url or "youtu.be" in url
+
+    if not is_youtube:
+        cap = cv2.VideoCapture(url)
+        return cap, lambda: None
+
+    if not ytdlp:
+        raise HTTPException(400, "yt-dlp not installed. Run: pip install yt-dlp")
+
+    # Step 1: resolve the live HLS URL (android player_client skips JS requirement)
+    res = subprocess.run(
+        [ytdlp, "--extractor-args", "youtube:player_client=android",
+         "-f", "best[height<=480][ext=mp4]/best[height<=480]/best",
+         "-g", "--no-playlist", "--quiet", url],
+        capture_output=True, text=True, timeout=30
+    )
+    hls_url = res.stdout.strip().splitlines()[0] if res.stdout.strip() else ""
+    if not hls_url:
+        raise HTTPException(400, f"yt-dlp could not resolve stream URL: {res.stderr[:200]}")
+
+    # Step 2: pipe HLS → ffmpeg → raw BGR frames
+    # Force 640x360 so frame size is always known (nbytes = 640*360*3)
+    # -user_agent required: YouTube returns 403 to ffmpeg without a browser UA
+    ffmpeg = _get_ffmpeg()
+    ff_proc = subprocess.Popen(
+        [
+            ffmpeg, "-loglevel", "quiet",
+            "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "-i", hls_url,
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-vf", "scale=640:360",  # exact size so frame bytes are predictable
+            "-r", "10",              # 10 fps — sufficient for CV
+            "pipe:1",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    return ff_proc, (640, 360), lambda: ff_proc.terminate()
+
+
+FFMPEG_W, FFMPEG_H = 640, 360
+
+
+def _read_ffmpeg_frame(ff_proc):
+    """Read one raw BGR frame from an ffmpeg pipe (640x360)."""
+    nbytes = FFMPEG_W * FFMPEG_H * 3
+    raw = b""
+    while len(raw) < nbytes:
+        chunk = ff_proc.stdout.read(nbytes - len(raw))
+        if not chunk:
+            return None
+        raw += chunk
+    return np.frombuffer(raw, np.uint8).reshape((FFMPEG_H, FFMPEG_W, 3))
+
+
+@app.get("/api/detect/stream/live", dependencies=[Depends(require_auth)])
+async def stream_from_url(
+    url:                str,
+    stop_line_y:        int  = 400,
+    frame_skip:         int  = 4,
+    max_seconds:        int  = 60,
+    signal_red:         bool = False,
+    stopline_enabled:   bool = False,
+    scene_type:         str  = "Junction",
+    wrong_side_present: bool = False,
+    flow_direction:     str  = "Left -> Right",
+    camera_id:          str  = "live_stream",
+):
+    is_youtube = "youtube.com" in url or "youtu.be" in url
+    reset_tracking(); reset_id_map()
+    yolo = _yolo()
+
+    async def generate():
+        ff_proc = None
+        cap     = None
+
+        if is_youtube:
+            yield f"data: {json.dumps({'status': 'connecting', 'msg': 'Resolving live stream via yt-dlp…'})}\n\n"
+            await asyncio.sleep(0)
+
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, _open_stream_cap, url
+            )
+        except HTTPException as e:
+            yield f"data: {json.dumps({'error': e.detail})}\n\n"
+            return
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            return
+
+        # result is either (cap, cleanup) or (ff_proc, (w,h), cleanup)
+        use_ffmpeg_pipe = is_youtube
+        if use_ffmpeg_pipe:
+            ff_proc, (frame_w, frame_h), cleanup = result
+        else:
+            cap, cleanup = result
+            if not cap.isOpened():
+                yield f"data: {json.dumps({'error': 'Cannot open stream URL.'})}\n\n"
+                return
+
+        if is_youtube:
+            yield f"data: {json.dumps({'status': 'live', 'msg': 'Connected — analysing live frames…'})}\n\n"
+            await asyncio.sleep(0)
+
+        frame_count    = 0
+        analysed_count = 0
+        max_frames     = max_seconds * 10 if use_ffmpeg_pipe else int(max_seconds * (cap.get(cv2.CAP_PROP_FPS) or 25))
+        temporal_counts: dict = defaultdict(int)
+        temporal_best:   dict = {}
+        confirmed_viols: list = []
+        # Key: "ViolationType::VehicleID" — one entry per (type, vehicle) pair
+        confirmed_keys: set   = set()
+
+        try:
+            while frame_count < max_frames:
+                if use_ffmpeg_pipe:
+                    raw_frame = await asyncio.get_event_loop().run_in_executor(
+                        None, _read_ffmpeg_frame, ff_proc
+                    )
+                    if raw_frame is None:
+                        break
+                else:
+                    ok, raw_frame = cap.read()
+                    if not ok:
+                        break
+
+                frame_count += 1
+                if frame_count % frame_skip != 0:
+                    continue
+
+                processed = preprocess(raw_frame, True)
+                analysed_count += 1
+
+                res = yolo.track(processed, persist=True, verbose=False)
+                det_result = detect_violations(
+                    res, stop_line_y, processed.shape[:2],
+                    frame_bgr=processed,
+                    helmet_model=_helmet(), seatbelt_model=_seatbelt(),
+                    wrongside_model=_wrongside(),
+                    signal_red=signal_red, stopline_enabled=stopline_enabled,
+                    scene_type=scene_type, wrong_side_present=wrong_side_present,
+                    flow_direction=flow_direction,
+                )
+                viols    = det_result["violations"]
+                vehicles = det_result["vehicles"]
+                _add_vehicle_category(viols, processed)
+
+                new_confirmed = []
+                for v in viols:
+                    v["frame"] = frame_count
+                    vtype  = v.get("type", "")
+                    vid    = v.get("vehicle_id", "unknown")
+                    conf   = v.get("confidence", 0)
+                    # Track per (violation_type, vehicle_id) — separate log per vehicle
+                    tkey   = f"{vtype}::{vid}"
+                    temporal_counts[tkey] += 1
+                    if tkey not in temporal_best or conf > temporal_best[tkey].get("confidence", 0):
+                        temporal_best[tkey] = v
+                    if tkey not in confirmed_keys:
+                        if temporal_counts[tkey] >= 2 or conf >= 0.38:
+                            c = _clean_viols([v])[0]
+                            c["sightings"] = temporal_counts[tkey]
+                            try:
+                                ev, db_id = _persist_violation(c, processed, camera_id)
+                                c["evidence_hash"] = ev
+                                c["db_id"] = db_id
+                            except Exception:
+                                pass
+                            confirmed_viols.append(c)
+                            confirmed_keys.add(tkey)
+                            new_confirmed.append(c)
+
+                annotated = annotate(processed, viols, vehicles=vehicles)
+                if stopline_enabled:
+                    cv2.line(annotated, (0, stop_line_y), (annotated.shape[1], stop_line_y), (0,0,255), 2)
+                h, w = annotated.shape[:2]
+                if w > 960:
+                    annotated = cv2.resize(annotated, (960, int(h * 960 / w)))
+                _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 72])
+                frame_b64 = base64.b64encode(buf).decode()
+
+                payload = json.dumps({
+                    "frame":           frame_count,
+                    "total":           max_frames,
+                    "progress":        round(frame_count / max(max_frames, 1) * 100),
+                    "frame_b64":       frame_b64,
+                    "current_viols":   _clean_viols(viols),
+                    "confirmed_viols": confirmed_viols,
+                    "new_confirmed":   new_confirmed,
+                    "done":            False,
+                })
+                yield f"data: {payload}\n\n"
+                await asyncio.sleep(0)
+
+        finally:
+            if cap:
+                cap.release()
+            if ff_proc:
+                ff_proc.terminate()
+                try:
+                    ff_proc.wait(timeout=3)
+                except Exception:
+                    pass
+
+        yield f"data: {json.dumps({'done': True, 'violations': confirmed_viols, 'total_frames': frame_count, 'frames_analysed': analysed_count})}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                 "Connection": "keep-alive", "Access-Control-Allow-Origin": "*"})
+
+
 # ── Plate clone check ─────────────────────────────────────────────────────────
 @app.get("/api/graph/clone/{plate}", dependencies=[Depends(require_auth)])
 def clone_check(plate: str, window_minutes: int = 30):
@@ -704,6 +1054,7 @@ async def stream_video_analysis(
     scene_type:         str  = "Junction",
     wrong_side_present: bool = False,
     flow_direction:     str  = "Left -> Right",
+    camera_id:          str  = "live_upload",
 ):
     tmp_path = _get_session_path(sid)
 
@@ -762,18 +1113,26 @@ async def stream_video_analysis(
                 for v in viols:
                     v["frame"] = frame_count
                     vtype = v.get("type", "")
+                    vid   = v.get("vehicle_id", "unknown")
                     conf  = v.get("confidence", 0)
+                    tkey  = f"{vtype}::{vid}"
 
-                    temporal_counts[vtype] += 1
-                    if vtype not in temporal_best or conf > temporal_best[vtype].get("confidence", 0):
-                        temporal_best[vtype] = v
+                    temporal_counts[tkey] += 1
+                    if tkey not in temporal_best or conf > temporal_best[tkey].get("confidence", 0):
+                        temporal_best[tkey] = v
 
-                    if vtype not in confirmed_types:
-                        if temporal_counts[vtype] >= 2 or conf >= 0.55:
+                    if tkey not in confirmed_types:
+                        if temporal_counts[tkey] >= 2 or conf >= 0.38:
                             c = _clean_viols([v])[0]
-                            c["sightings"] = temporal_counts[vtype]
+                            c["sightings"] = temporal_counts[tkey]
+                            try:
+                                ev, db_id = _persist_violation(c, processed, camera_id)
+                                c["evidence_hash"] = ev
+                                c["db_id"] = db_id
+                            except Exception:
+                                pass
                             confirmed_viols.append(c)
-                            confirmed_types.add(vtype)
+                            confirmed_types.add(tkey)
                             new_confirmed.append(c)
 
                 annotated = annotate(processed, viols, vehicles=vehicles)
@@ -865,11 +1224,21 @@ def _try_ollama(question: str, context: str) -> str | None:
         models = [m["name"] for m in tags_r.json().get("models", [])]
         if not models:
             return None
-        preferred = next((m for m in models if "llama3" in m.lower()), None) or \
-                    next((m for m in models if "mistral" in m.lower()), None) or \
-                    models[0]
+        # Prefer small fast models — 1b/3b respond in ~5s on CPU vs 30s for 7b
+        preferred = (
+            next((m for m in models if "llama3.2:1b" in m.lower()), None) or
+            next((m for m in models if "llama3.2:3b" in m.lower()), None) or
+            next((m for m in models if "llama3" in m.lower()), None) or
+            next((m for m in models if "phi3" in m.lower()), None) or
+            next((m for m in models if "mistral" in m.lower()), None) or
+            models[0]
+        )
     except Exception:
         return None
+
+    # Estimate timeout: 1b/3b models are fast; 7b+ need longer on CPU
+    is_large = any(tag in preferred for tag in ["7b", "8b", "13b", "70b"])
+    timeout_s = 50 if is_large else 20
 
     try:
         r = http_requests.post(
@@ -879,15 +1248,22 @@ def _try_ollama(question: str, context: str) -> str | None:
                 "system": (
                     "You are DrishtiVia AI Agent — an assistant for a Bengaluru traffic "
                     "violation detection system. Answer concisely using the database context provided. "
-                    "Use markdown bold (**text**) for emphasis. Keep answers under 150 words."
+                    "Use markdown bold (**text**) for emphasis. Keep answers under 80 words."
                 ),
                 "prompt": f"Database context:\n{context}\n\nQuestion: {question}",
                 "stream": False,
+                "options": {
+                    "num_predict": 120,
+                    "temperature": 0.3,
+                    "num_gpu": 0,      # force CPU — avoids CUDA_Host OOM on large models
+                },
             },
-            timeout=30,
+            timeout=timeout_s,
         )
         if r.status_code == 200:
-            return r.json().get("response", "").strip()
+            ans = r.json().get("response", "").strip()
+            if ans:
+                return ans
     except Exception:
         pass
     return None
@@ -1023,6 +1399,86 @@ def agent_query(body: AgentQuery):
 
     con.close()
     return {"answer": answer, "question": body.question}
+
+
+@app.get("/api/agent/stream", dependencies=[Depends(require_auth)])
+async def agent_stream(question: str):
+    """SSE endpoint — streams Ollama tokens in real time, falls back to rule-based."""
+    q       = question.strip()
+    context = _build_db_context()
+
+    async def generate():
+        # Check if Ollama is available
+        try:
+            tags_r = http_requests.get("http://localhost:11434/api/tags", timeout=3)
+            models = [m["name"] for m in tags_r.json().get("models", [])] if tags_r.status_code == 200 else []
+        except Exception:
+            models = []
+
+        if models:
+            preferred = (
+                next((m for m in models if "llama3.2:1b" in m.lower()), None) or
+                next((m for m in models if "llama3.2" in m.lower()), None) or
+                next((m for m in models if "llama3" in m.lower()), None) or
+                next((m for m in models if "phi3" in m.lower()), None) or
+                next((m for m in models if "mistral" in m.lower()), None) or
+                models[0]
+            )
+            yield f"data: {json.dumps({'token': '', 'source': 'ollama', 'model': preferred})}\n\n"
+            await asyncio.sleep(0)
+
+            try:
+                # Use requests with stream=True so we get tokens as they arrive
+                def _stream_ollama():
+                    return http_requests.post(
+                        "http://localhost:11434/api/generate",
+                        json={
+                            "model": preferred,
+                            "system": (
+                                "You are DrishtiVia AI Agent for a Bengaluru traffic violation system. "
+                                "Answer concisely using the data provided. Use **bold** for emphasis. "
+                                "Keep answers under 80 words."
+                            ),
+                            "prompt": f"Database context:\n{context}\n\nQuestion: {q}",
+                            "stream": True,
+                            "options": {"num_predict": 120, "temperature": 0.3, "num_gpu": 0},
+                        },
+                        stream=True,
+                        timeout=60,
+                    )
+
+                resp = await asyncio.get_event_loop().run_in_executor(None, _stream_ollama)
+                if resp.status_code == 200:
+                    for line in resp.iter_lines():
+                        if not line:
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                            token = chunk.get("response", "")
+                            if token:
+                                yield f"data: {json.dumps({'token': token})}\n\n"
+                                await asyncio.sleep(0)
+                            if chunk.get("done"):
+                                yield f"data: {json.dumps({'done': True, 'source': 'ollama'})}\n\n"
+                                return
+                        except Exception:
+                            continue
+                    yield f"data: {json.dumps({'done': True, 'source': 'ollama'})}\n\n"
+                    return
+            except Exception:
+                pass  # fall through to rule-based
+
+        # Rule-based fallback — emit answer as single token burst
+        body_obj = AgentQuery(question=q)
+        result   = agent_query(body_obj)
+        answer   = result.get("answer", "")
+        yield f"data: {json.dumps({'token': answer, 'source': 'rule-based'})}\n\n"
+        yield f"data: {json.dumps({'done': True, 'source': 'rule-based'})}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                 "Connection": "keep-alive", "Access-Control-Allow-Origin": "*"})
+
 
 # ── Escalation report ─────────────────────────────────────────────────────────
 @app.get("/api/report/{vid}", dependencies=[Depends(require_auth)])

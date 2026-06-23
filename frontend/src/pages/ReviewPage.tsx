@@ -103,7 +103,7 @@ function ViolationDetail({ v, onClose, onAction }: {
               ["Priority Level", v.priority_level ?? "—"],
               ["Camera",         v.camera_id || "—"],
               ["Timestamp",      fmtTs(v.timestamp)],
-              ["Evidence Hash",  v.evidence_hash ? v.evidence_hash.slice(0, 16) + "…" : "—"],
+              ["Evidence Hash",  v.evidence_hash ?? "—"],
             ].map(([k, val]) => (
               <div key={k} className="bg-neutral-50 rounded-[3px] p-3">
                 <p className="text-[9px] font-bold tracking-widest uppercase text-neutral-400 mb-0.5">{k}</p>

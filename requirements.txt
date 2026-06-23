@@ -20,3 +20,6 @@ reportlab>=4.0.0
 
 # Environment variable loading (optional — .env file support)
 python-dotenv>=1.0.0
+
+# YouTube / RTSP live stream support
+yt-dlp>=2024.1.0
