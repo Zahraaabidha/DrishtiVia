@@ -6,7 +6,7 @@ IMPORTANT: This file imports ONLY from detect_core.py (zero Streamlit dependency
 Never import from app.py — it has module-level st.tabs() / st.set_page_config()
 calls that crash immediately outside a Streamlit server.
 """
-import os, base64, tempfile, sqlite3, re, time, json, uuid, asyncio
+import os, base64, tempfile, sqlite3, re, time, json, uuid, asyncio, threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from collections import defaultdict, deque
@@ -14,13 +14,17 @@ from collections import defaultdict, deque
 import cv2
 import numpy as np
 import requests as http_requests
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
-# Video session store (session_id -> tmp_file_path)
-_video_sessions: dict = {}
+# Load .env if present (python-dotenv optional)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # ── detect_core: pure Python, no Streamlit ────────────────────────────────────
 from detect_core import (
@@ -32,25 +36,83 @@ from detect_core import (
     reset_id_map,
 )
 
-# ── paths ─────────────────────────────────────────────────────────────────────
+# ── config from environment ───────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
-DB_PATH  = BASE_DIR / "evidence_store" / "violations.db"
-SNAP_DIR = BASE_DIR / "evidence_store" / "snapshots"
+DB_PATH  = Path(os.getenv("DB_PATH",  str(BASE_DIR / "evidence_store" / "violations.db")))
+SNAP_DIR = Path(os.getenv("SNAP_DIR", str(BASE_DIR / "evidence_store" / "snapshots")))
 SNAP_DIR.mkdir(parents=True, exist_ok=True)
 
-HELMET_PATH    = BASE_DIR / "runs/detect/runs/helmet_train/violavision_v1/weights/best.pt"
-SEATBELT_PATH  = BASE_DIR / "runs/detect/runs/seatbelt_train/violavision_seatbelt_v1-2/weights/best.pt"
-WRONGSIDE_PATH = BASE_DIR / "runs/detect/runs/wrongside_train/violavision_wrongside_v1/weights/best.pt"
+HELMET_PATH    = Path(os.getenv("HELMET_MODEL",    str(BASE_DIR / "runs/detect/runs/helmet_train/violavision_v1/weights/best.pt")))
+SEATBELT_PATH  = Path(os.getenv("SEATBELT_MODEL",  str(BASE_DIR / "runs/detect/runs/seatbelt_train/violavision_seatbelt_v1-2/weights/best.pt")))
+WRONGSIDE_PATH = Path(os.getenv("WRONGSIDE_MODEL", str(BASE_DIR / "runs/detect/runs/wrongside_train/violavision_wrongside_v1/weights/best.pt")))
+
+# API key auth — set API_KEY env var to enable; leave blank to run without auth (dev/demo)
+_API_KEY = os.getenv("API_KEY", "").strip()
+
+# CORS — comma-separated list of allowed origins
+_CORS_ORIGINS = [o.strip() for o in os.getenv(
+    "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+).split(",") if o.strip()]
+
+# File size limits
+MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_MB", "10"))  * 1024 * 1024
+MAX_VIDEO_BYTES = int(os.getenv("MAX_VIDEO_MB", "200")) * 1024 * 1024
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(title="DrishtiVia API", version="2.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Auth dependency ───────────────────────────────────────────────────────────
+def require_auth(x_api_key: str = Header(default="")):
+    """Enforce API key if one is configured. Skipped when API_KEY env var is empty."""
+    if _API_KEY and x_api_key != _API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
+
+# ── Simple in-memory rate limiter for expensive endpoints ─────────────────────
+_rate_buckets: dict = defaultdict(list)
+_rate_lock = threading.Lock()
+
+def _check_rate(request: Request, max_per_minute: int):
+    ip  = request.client.host if request.client else "unknown"
+    key = f"{ip}:{request.url.path}"
+    now = time.time()
+    with _rate_lock:
+        _rate_buckets[key] = [t for t in _rate_buckets[key] if now - t < 60]
+        if len(_rate_buckets[key]) >= max_per_minute:
+            raise HTTPException(429, "Rate limit exceeded — try again in a minute")
+        _rate_buckets[key].append(now)
+
+# ── Video session store: session_id -> (tmp_file_path, created_timestamp) ─────
+_video_sessions: dict[str, tuple[str, float]] = {}
+
+def _get_session_path(sid: str) -> str:
+    entry = _video_sessions.get(sid)
+    if not entry:
+        raise HTTPException(404, "Session not found or expired — re-upload the video")
+    path, _ = entry
+    if not Path(path).exists():
+        raise HTTPException(404, "Session file missing — re-upload the video")
+    return path
+
+def _cleanup_stale_sessions():
+    """Background thread: delete temp video files older than 30 minutes."""
+    while True:
+        time.sleep(300)
+        now  = time.time()
+        stale = [sid for sid, (_, ts) in list(_video_sessions.items()) if now - ts > 1800]
+        for sid in stale:
+            entry = _video_sessions.pop(sid, None)
+            if entry:
+                try:
+                    Path(entry[0]).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
 # ── lazy model cache ──────────────────────────────────────────────────────────
 _models: dict = {}
@@ -96,6 +158,7 @@ def _ocr():
 
 # ── DB ─────────────────────────────────────────────────────────────────────────
 def _db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(DB_PATH), check_same_thread=False)
     con.row_factory = sqlite3.Row
     return con
@@ -104,6 +167,51 @@ def _row_to_dict(row) -> dict:
     d = dict(row)
     d["severity"] = d.get("priority_level") or "LOW"
     return d
+
+# ── startup: DB indexes + signing key + session cleanup thread ─────────────────
+@app.on_event("startup")
+def _startup():
+    # Ensure DB indexes exist for fast queries
+    con = _db()
+    con.execute("CREATE INDEX IF NOT EXISTS idx_plate    ON violations(plate_number)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_ts       ON violations(timestamp)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_camera   ON violations(camera_id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_action   ON violations(operator_action)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_priority ON violations(priority_level)")
+    con.commit()
+    con.close()
+
+    # Auto-generate signing key if missing
+    key_path = BASE_DIR / "models" / "signing_key.pem"
+    if not key_path.exists():
+        try:
+            from cryptography.hazmat.primitives.asymmetric import rsa
+            from cryptography.hazmat.primitives import serialization
+            key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            key_path.parent.mkdir(parents=True, exist_ok=True)
+            key_path.write_bytes(key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption(),
+            ))
+        except ImportError:
+            pass  # cryptography package not installed — signing unavailable
+
+    # Start background cleanup thread for stale video sessions
+    t = threading.Thread(target=_cleanup_stale_sessions, daemon=True)
+    t.start()
+
+    # Pre-load all models at startup so the first video request doesn't cold-start
+    # PyTorch + YOLO weights (which causes the "Connecting..." delay of 5-15s)
+    def _warm_models():
+        try:
+            _yolo()
+            _helmet()
+            _seatbelt()
+            _wrongside()
+        except Exception:
+            pass
+    threading.Thread(target=_warm_models, daemon=True).start()
 
 # ── image helpers ──────────────────────────────────────────────────────────────
 _PLATE_RE = re.compile(r"^[A-Z]{2}[0-9]{2}[A-Z]{1,3}[0-9]{3,4}$")
@@ -134,7 +242,6 @@ def _clean_viols(viols: list) -> list:
     out = []
     for v in viols:
         c = {k: val for k, val in v.items() if k != "geo_features"}
-        # numpy int -> python int
         if "bbox" in c:
             c["bbox"] = [float(x) for x in c["bbox"]]
         out.append(c)
@@ -154,7 +261,7 @@ def _add_vehicle_category(viols: list, frame: np.ndarray) -> list:
 # ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Health ────────────────────────────────────────────────────────────────────
+# ── Health (public — no auth required) ───────────────────────────────────────
 @app.get("/api/health")
 def health():
     return {
@@ -170,7 +277,7 @@ def health():
     }
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
-@app.get("/api/stats")
+@app.get("/api/stats", dependencies=[Depends(require_auth)])
 def stats():
     con = _db(); cur = con.cursor()
     cur.execute("SELECT COUNT(*) FROM violations")
@@ -190,7 +297,7 @@ def stats():
             "confirmed": confirmed, "top_types": top_types, "by_camera": by_camera}
 
 # ── Violations list ───────────────────────────────────────────────────────────
-@app.get("/api/violations")
+@app.get("/api/violations", dependencies=[Depends(require_auth)])
 def violations(
     limit:          int  = 100,
     offset:         int  = 0,
@@ -217,7 +324,6 @@ def violations(
         where_clauses.append("UPPER(violation_type) LIKE ?")
         params.append(f"%{violation_type.upper()}%")
     if severity:
-        # Support comma-separated e.g. "CRITICAL,HIGH"
         sevs = [s.strip().upper() for s in severity.split(",") if s.strip()]
         where_clauses.append(f"UPPER(priority_level) IN ({','.join('?' for _ in sevs)})")
         params.extend(sevs)
@@ -234,7 +340,6 @@ def violations(
     where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
     order_sql = "ORDER BY timestamp ASC" if sort == "oldest" else "ORDER BY timestamp DESC"
 
-    # Count total (for pagination)
     cur.execute(f"SELECT COUNT(*) FROM violations {where_sql}", params)
     total = cur.fetchone()[0]
 
@@ -245,7 +350,7 @@ def violations(
     return {"violations": rows, "count": len(rows), "total": total}
 
 # ── Search ────────────────────────────────────────────────────────────────────
-@app.get("/api/search")
+@app.get("/api/search", dependencies=[Depends(require_auth)])
 def search(q: str = Query(""), limit: int = 50):
     if not q.strip():
         return {"results": [], "count": 0}
@@ -267,7 +372,7 @@ def search(q: str = Query(""), limit: int = 50):
 class ActionBody(BaseModel):
     action: str
 
-@app.post("/api/violations/{vid}/action")
+@app.post("/api/violations/{vid}/action", dependencies=[Depends(require_auth)])
 def violation_action(vid: int, body: ActionBody):
     con = _db()
     con.execute("UPDATE violations SET operator_action=? WHERE id=?",
@@ -276,8 +381,9 @@ def violation_action(vid: int, body: ActionBody):
     return {"ok": True, "id": vid, "action": body.action}
 
 # ── Detect image ──────────────────────────────────────────────────────────────
-@app.post("/api/detect/image")
+@app.post("/api/detect/image", dependencies=[Depends(require_auth)])
 async def detect_image(
+    request: Request,
     file: UploadFile = File(...),
     stop_line_y: int = 400,
     signal_red: bool = False,
@@ -287,7 +393,11 @@ async def detect_image(
     flow_direction: str = "Left -> Right",
     preprocessing: bool = True,
 ):
-    data  = await file.read()
+    _check_rate(request, max_per_minute=30)
+    data = await file.read()
+    if len(data) > MAX_IMAGE_BYTES:
+        raise HTTPException(413, f"Image exceeds {MAX_IMAGE_BYTES // 1024 // 1024}MB limit")
+
     frame = _bgr_from_bytes(data)
     if frame is None:
         raise HTTPException(400, "Could not decode image")
@@ -324,8 +434,9 @@ async def detect_image(
     }
 
 # ── Detect video (ByteTrack) ───────────────────────────────────────────────────
-@app.post("/api/detect/video")
+@app.post("/api/detect/video", dependencies=[Depends(require_auth)])
 async def detect_video(
+    request: Request,
     file: UploadFile = File(...),
     stop_line_y: int = 400,
     frame_skip: int = 6,
@@ -336,14 +447,17 @@ async def detect_video(
     wrong_side_present: bool = False,
     flow_direction: str = "Left -> Right",
 ):
-    data   = await file.read()
-    suffix = Path(file.filename or "vid.mp4").suffix or ".mp4"
+    _check_rate(request, max_per_minute=5)
+    data = await file.read()
+    if len(data) > MAX_VIDEO_BYTES:
+        raise HTTPException(413, f"Video exceeds {MAX_VIDEO_BYTES // 1024 // 1024}MB limit")
 
+    suffix = Path(file.filename or "vid.mp4").suffix or ".mp4"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(data)
         tmp_path = tmp.name
 
-    reset_tracking(); reset_id_map()   # clear position history + vehicle IDs from any previous clip
+    reset_tracking(); reset_id_map()
     yolo = _yolo()
 
     cap        = cv2.VideoCapture(tmp_path)
@@ -399,7 +513,6 @@ async def detect_video(
                 if vtype not in temporal_best or conf > temporal_best[vtype].get("confidence", 0):
                     temporal_best[vtype] = v
 
-                # Confirm on 2nd sighting or immediately if very high confidence
                 if vtype not in confirmed_types:
                     if temporal_counts[vtype] >= 2 or conf >= 0.55:
                         c = _clean_viols([v])[0]
@@ -411,16 +524,15 @@ async def detect_video(
     finally:
         cap.release()
         try:
-            Path(tmp_path).unlink()
+            Path(tmp_path).unlink(missing_ok=True)
         except Exception:
             pass
 
-    # Include best single-frame detections for rare violations not hitting 3-of-5
     for key, v in temporal_best.items():
         vtype = v.get("type", "")
         if vtype not in confirmed_types and temporal_counts.get(key, 0) >= 1:
             c = _clean_viols([v])[0]
-            c["note"] = f"Single-frame only (seen {temporal_counts[key]}× — below 3-of-5 threshold)"
+            c["note"] = f"Single-frame only (seen {temporal_counts[key]}× — below threshold)"
             confirmed_viols.append(c)
             confirmed_types.add(vtype)
 
@@ -432,7 +544,7 @@ async def detect_video(
     }
 
 # ── Analytics ─────────────────────────────────────────────────────────────────
-@app.get("/api/analytics")
+@app.get("/api/analytics", dependencies=[Depends(require_auth)])
 def analytics(days: int = 7):
     con = _db(); cur = con.cursor()
     since = (datetime.now() - timedelta(days=days)).timestamp()
@@ -452,7 +564,6 @@ def analytics(days: int = 7):
     """, (since,))
     offenders = [{"plate": r[0], "count": r[1], "types": r[2]} for r in cur.fetchall()]
 
-    # camera hotspots with coords (known Bangalore junctions)
     cur.execute("""
         SELECT camera_id, COUNT(*) as cnt, AVG(priority_score) as avg_p
         FROM violations GROUP BY camera_id ORDER BY cnt DESC
@@ -498,7 +609,7 @@ def analytics(days: int = 7):
     }
 
 # ── Knowledge Graph ───────────────────────────────────────────────────────────
-@app.get("/api/graph")
+@app.get("/api/graph", dependencies=[Depends(require_auth)])
 def knowledge_graph(limit: int = 80):
     con = _db(); cur = con.cursor()
     cur.execute("""
@@ -523,7 +634,7 @@ def knowledge_graph(limit: int = 80):
     return {"edges": edges, "repeat_offenders": offenders, "hotspots": hotspots}
 
 # ── Plate clone check ─────────────────────────────────────────────────────────
-@app.get("/api/graph/clone/{plate}")
+@app.get("/api/graph/clone/{plate}", dependencies=[Depends(require_auth)])
 def clone_check(plate: str, window_minutes: int = 30):
     cutoff = (datetime.now() - timedelta(minutes=window_minutes)).timestamp()
     con = _db(); cur = con.cursor()
@@ -541,7 +652,7 @@ def clone_check(plate: str, window_minutes: int = 30):
 class VerifyBody(BaseModel):
     evidence_hash: str
 
-@app.post("/api/verify")
+@app.post("/api/verify", dependencies=[Depends(require_auth)])
 def verify_evidence(body: VerifyBody):
     con = _db(); cur = con.cursor()
     cur.execute("SELECT * FROM violations WHERE evidence_hash=?", (body.evidence_hash,))
@@ -556,41 +667,45 @@ def verify_evidence(body: VerifyBody):
             "snapshots": {"full": snap_full.exists(), "crop": snap_crop.exists()}}
 
 # ── Snapshot image ────────────────────────────────────────────────────────────
-@app.get("/api/snapshot/{hash16}/{kind}")
+@app.get("/api/snapshot/{hash16}/{kind}", dependencies=[Depends(require_auth)])
 def snapshot(hash16: str, kind: str):
+    if kind not in ("full", "crop"):
+        raise HTTPException(400, "kind must be 'full' or 'crop'")
     path = SNAP_DIR / f"{hash16}_{kind}.jpg"
     if not path.exists():
         raise HTTPException(404, "Snapshot not found")
     return FileResponse(str(path), media_type="image/jpeg")
 
 # ── Video upload + SSE streaming ──────────────────────────────────────────────
-@app.post("/api/detect/video/upload")
-async def upload_video_for_stream(file: UploadFile = File(...)):
-    data   = await file.read()
+@app.post("/api/detect/video/upload", dependencies=[Depends(require_auth)])
+async def upload_video_for_stream(request: Request, file: UploadFile = File(...)):
+    _check_rate(request, max_per_minute=5)
+    data = await file.read()
+    if len(data) > MAX_VIDEO_BYTES:
+        raise HTTPException(413, f"Video exceeds {MAX_VIDEO_BYTES // 1024 // 1024}MB limit")
+
     suffix = Path(file.filename or "vid.mp4").suffix or ".mp4"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(data)
         tmp_path = tmp.name
     sid = str(uuid.uuid4())
-    _video_sessions[sid] = tmp_path
+    _video_sessions[sid] = (tmp_path, time.time())
     return {"session_id": sid}
 
 
-@app.get("/api/detect/video/stream/{sid}")
+@app.get("/api/detect/video/stream/{sid}", dependencies=[Depends(require_auth)])
 async def stream_video_analysis(
     sid: str,
     stop_line_y: int = 400,
-    frame_skip:  int = 6,    # process every 6th frame (~4fps effective at 25fps) for speed
+    frame_skip:  int = 6,
     max_seconds: int = 60,
-    signal_red:        bool = False,
-    stopline_enabled:  bool = False,
-    scene_type:        str  = "Junction",
+    signal_red:         bool = False,
+    stopline_enabled:   bool = False,
+    scene_type:         str  = "Junction",
     wrong_side_present: bool = False,
-    flow_direction:    str  = "Left -> Right",
+    flow_direction:     str  = "Left -> Right",
 ):
-    tmp_path = _video_sessions.get(sid)
-    if not tmp_path or not Path(tmp_path).exists():
-        raise HTTPException(404, "Session not found or expired — re-upload the video")
+    tmp_path = _get_session_path(sid)
 
     reset_tracking(); reset_id_map()
     yolo = _yolo()
@@ -615,7 +730,6 @@ async def stream_video_analysis(
                 if frame_count % frame_skip != 0:
                     continue
 
-                # Downscale to 640px wide for YOLO speed; annotated output upscales back
                 h0, w0 = raw_frame.shape[:2]
                 scale_down = min(1.0, 640 / max(w0, 1))
                 if scale_down < 1.0:
@@ -626,16 +740,14 @@ async def stream_video_analysis(
                 processed  = preprocess(small, True)
                 analysed_count += 1
 
-                run_finetune = True  # run fine-tuned models every processed frame
-
                 res = yolo.track(processed, persist=True, verbose=False)
 
                 det_result = detect_violations(
                     res, int(stop_line_y * scale_down), processed.shape[:2],
                     frame_bgr=processed,
-                    helmet_model=_helmet()    if run_finetune else None,
-                    seatbelt_model=_seatbelt() if run_finetune else None,
-                    wrongside_model=_wrongside() if run_finetune else None,
+                    helmet_model=_helmet(),
+                    seatbelt_model=_seatbelt(),
+                    wrongside_model=_wrongside(),
                     signal_red=signal_red,
                     stopline_enabled=stopline_enabled,
                     scene_type=scene_type,
@@ -652,14 +764,11 @@ async def stream_video_analysis(
                     vtype = v.get("type", "")
                     conf  = v.get("confidence", 0)
 
-                    # Count by violation TYPE (not track_id) — track IDs change across frames
                     temporal_counts[vtype] += 1
                     if vtype not in temporal_best or conf > temporal_best[vtype].get("confidence", 0):
                         temporal_best[vtype] = v
 
-                    # Confirm on 2nd sighting OR immediately if very high confidence (>= 0.65)
-                    already_confirmed = vtype in confirmed_types
-                    if not already_confirmed:
+                    if vtype not in confirmed_types:
                         if temporal_counts[vtype] >= 2 or conf >= 0.55:
                             c = _clean_viols([v])[0]
                             c["sightings"] = temporal_counts[vtype]
@@ -667,14 +776,12 @@ async def stream_video_analysis(
                             confirmed_types.add(vtype)
                             new_confirmed.append(c)
 
-                # Annotate with vehicle IDs + violation overlays
                 annotated = annotate(processed, viols, vehicles=vehicles)
                 if stopline_enabled:
                     cv2.line(annotated, (0, stop_line_y), (annotated.shape[1], stop_line_y), (0, 0, 255), 2)
                     cv2.putText(annotated, "STOP LINE", (8, stop_line_y - 6),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
 
-                # Resize for bandwidth (cap at 960px wide)
                 h, w = annotated.shape[:2]
                 if w > 960:
                     scale     = 960 / w
@@ -694,17 +801,17 @@ async def stream_video_analysis(
                     "done":            False,
                 })
                 yield f"data: {payload}\n\n"
-                await asyncio.sleep(0)   # yield control to event loop
+                await asyncio.sleep(0)
 
         finally:
             cap.release()
-            try:
-                Path(tmp_path).unlink()
-                _video_sessions.pop(sid, None)
-            except Exception:
-                pass
+            entry = _video_sessions.pop(sid, None)
+            if entry:
+                try:
+                    Path(entry[0]).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
-        # Final done event
         yield f"data: {json.dumps({'done': True, 'violations': confirmed_viols, 'total_frames': frame_count, 'frames_analysed': frame_count // max(frame_skip, 1)})}\n\n"
 
     return StreamingResponse(
@@ -721,7 +828,6 @@ async def stream_video_analysis(
 
 # ── AI Agent (Ollama-powered with rule-based fallback) ────────────────────────
 def _build_db_context() -> str:
-    """Gather live DB stats to inject as LLM context."""
     con = _db(); cur = con.cursor()
     cur.execute("SELECT COUNT(*) FROM violations"); total = cur.fetchone()[0]
     cur.execute("SELECT COUNT(*) FROM violations WHERE operator_action IS NULL"); pending = cur.fetchone()[0]
@@ -744,16 +850,14 @@ def _build_db_context() -> str:
         f"- Top violation types: {top_types}\n"
         f"- Top cameras by violations: {top_cams}\n"
         f"- Repeat offenders (>=2): {offenders or 'none'}\n"
-        f"- Models: Wrong-Side (mAP50=0.975), Seatbelt (mAP50=0.901, P=0.888, R=0.859), "
-        f"Helmet (mAP50~0.82), + base YOLOv8s for Triple Riding / Stop-Line / Parking\n"
+        f"- Models: Wrong-Side (mAP50=0.977, P=0.943, R=0.961), Seatbelt (mAP50=0.911, P=0.912, R=0.842), "
+        f"Helmet (mAP50=0.788, P=0.845, R=0.626), + base YOLOv8s for Triple Riding / Stop-Line / Parking\n"
         f"- Preprocessing: CLAHE + dark-channel dehazing active on every frame\n"
-        f"- Confirmation: temporal 3-of-5 (violation seen 3 out of last 5 frames before alerting)\n"
+        f"- Confirmation: temporal 2-sighting confirmation before alerting\n"
     )
 
 
 def _try_ollama(question: str, context: str) -> str | None:
-    """Try Ollama local LLM. Returns text or None if unavailable."""
-    # auto-detect installed models
     try:
         tags_r = http_requests.get("http://localhost:11434/api/tags", timeout=3)
         if tags_r.status_code != 200:
@@ -761,7 +865,6 @@ def _try_ollama(question: str, context: str) -> str | None:
         models = [m["name"] for m in tags_r.json().get("models", [])]
         if not models:
             return None
-        # prefer llama3 > mistral > anything else
         preferred = next((m for m in models if "llama3" in m.lower()), None) or \
                     next((m for m in models if "mistral" in m.lower()), None) or \
                     models[0]
@@ -793,22 +896,19 @@ def _try_ollama(question: str, context: str) -> str | None:
 class AgentQuery(BaseModel):
     question: str
 
-@app.post("/api/agent")
+@app.post("/api/agent", dependencies=[Depends(require_auth)])
 def agent_query(body: AgentQuery):
     q       = body.question.strip()
     context = _build_db_context()
 
-    # Try Ollama first
     ollama_answer = _try_ollama(q, context)
     if ollama_answer:
         return {"answer": ollama_answer, "question": body.question, "source": "ollama"}
 
-    # ── Rule-based fallback ────────────────────────────────────────────────────
     ql  = q.lower()
     con = _db(); cur = con.cursor()
     answer = None
 
-    # Total violations
     if any(w in ql for w in ["how many violation", "total violation", "count"]):
         cur.execute("SELECT COUNT(*) FROM violations")
         n = cur.fetchone()[0]
@@ -816,23 +916,17 @@ def agent_query(body: AgentQuery):
         p = cur.fetchone()[0]
         answer = f"There are **{n} total violations** in the database. **{p}** are still pending review."
 
-    # Most common
     elif any(w in ql for w in ["most common", "top violation", "frequent"]):
         cur.execute("SELECT violation_type, COUNT(*) as c FROM violations GROUP BY violation_type ORDER BY c DESC LIMIT 3")
         rows = cur.fetchall()
         lines = [f"{i+1}. **{r[0]}** — {r[1]} incidents" for i, r in enumerate(rows)]
         answer = "Top 3 violation types:\n" + "\n".join(lines)
 
-    # Worst camera / hotspot
     elif any(w in q for w in ["worst camera", "hotspot", "most violation camera", "busiest"]):
         cur.execute("SELECT camera_id, COUNT(*) as c FROM violations GROUP BY camera_id ORDER BY c DESC LIMIT 1")
         r = cur.fetchone()
-        if r:
-            answer = f"The camera with the most violations is **{r[0]}** with **{r[1]} recorded incidents**."
-        else:
-            answer = "No camera data found yet."
+        answer = f"The camera with the most violations is **{r[0]}** with **{r[1]} recorded incidents**." if r else "No camera data found yet."
 
-    # Repeat offenders
     elif any(w in q for w in ["repeat offend", "serial", "multiple violation"]):
         cur.execute("""
             SELECT plate_number, COUNT(*) as c,
@@ -847,7 +941,6 @@ def agent_query(body: AgentQuery):
         else:
             answer = "No repeat offenders found in the database yet."
 
-    # Pending / unreviewed
     elif any(w in q for w in ["pending", "unreviewed", "need review", "action"]):
         cur.execute("SELECT COUNT(*) FROM violations WHERE operator_action IS NULL")
         n = cur.fetchone()[0]
@@ -860,7 +953,6 @@ def agent_query(body: AgentQuery):
         lines = [f"- {r[0]}: {r[1]}" for r in rows]
         answer = f"**{n} violations** are pending review. Top pending types:\n" + "\n".join(lines)
 
-    # Specific plate
     elif re.search(r"[A-Z]{2}\d{2}", q.upper()):
         plate_match = re.search(r"[A-Z]{2}\d{2}[A-Z0-9]+", q.upper())
         if plate_match:
@@ -873,7 +965,6 @@ def agent_query(body: AgentQuery):
             else:
                 answer = f"No records found for plate `{plate}`."
 
-    # CRITICAL violations
     elif any(w in q for w in ["critical", "severe", "dangerous", "urgent"]):
         cur.execute("SELECT COUNT(*) FROM violations WHERE priority_level='CRITICAL'")
         n = cur.fetchone()[0]
@@ -886,45 +977,39 @@ def agent_query(body: AgentQuery):
         lines = [f"- {r[0]} | {r[1]} | plate: {r[2]}" for r in rows]
         answer = f"**{n} CRITICAL violations** on record. Most recent:\n" + "\n".join(lines)
 
-    # Today
     elif any(w in q for w in ["today", "this morning", "last hour"]):
         since = (datetime.now() - timedelta(hours=24)).timestamp()
         cur.execute("SELECT COUNT(*) FROM violations WHERE timestamp > ?", (since,))
         n = cur.fetchone()[0]
         answer = f"**{n} violations** recorded in the last 24 hours."
 
-    # Helmet specific
     elif "helmet" in q:
         cur.execute("SELECT COUNT(*) FROM violations WHERE violation_type='Helmet Non-Compliance'")
         n = cur.fetchone()[0]
         answer = f"**{n} Helmet Non-Compliance** violations on record. The model uses a fine-tuned YOLOv8 classifier at 0.45 confidence threshold for HIGH severity, 0.20 for MEDIUM (human review required)."
 
-    # Wrong side
     elif any(w in q for w in ["wrong side", "wrong-side", "opposite"]):
         cur.execute("SELECT COUNT(*) FROM violations WHERE violation_type='Wrong-Side Driving'")
         n = cur.fetchone()[0]
-        answer = f"**{n} Wrong-Side Driving** violations on record. This uses a fine-tuned model with mAP50=0.975 — your highest-accuracy detector."
+        answer = f"**{n} Wrong-Side Driving** violations on record. This uses a fine-tuned model with mAP50=0.977 — your highest-accuracy detector."
 
-    # Seatbelt
     elif "seatbelt" in q or "seat belt" in q:
         cur.execute("SELECT COUNT(*) FROM violations WHERE violation_type='Seatbelt Non-Compliance'")
         n = cur.fetchone()[0]
-        answer = f"**{n} Seatbelt Non-Compliance** violations. The model achieved mAP50=0.901 (precision 0.888, recall 0.859)."
+        answer = f"**{n} Seatbelt Non-Compliance** violations. The model achieved mAP50=0.911 (precision 0.912, recall 0.842)."
 
-    # Accuracy / models
     elif any(w in q for w in ["accuracy", "model", "map", "precision", "recall"]):
         answer = (
             "**Model accuracy summary:**\n"
-            "- Wrong-Side Driving: mAP50 **0.975** (fine-tuned YOLOv8)\n"
-            "- Seatbelt: mAP50 **0.901**, P=0.888, R=0.859 (fine-tuned)\n"
-            "- Helmet: mAP50 ~0.82 (fine-tuned, threshold 0.45 HIGH / 0.20 MEDIUM)\n"
+            "- Wrong-Side Driving: mAP50 **0.977**, P=0.943, R=0.961 (fine-tuned YOLOv8)\n"
+            "- Seatbelt: mAP50 **0.911**, P=0.912, R=0.842 (fine-tuned)\n"
+            "- Helmet: mAP50 **0.788**, P=0.845, R=0.626 (fine-tuned, threshold 0.55 HIGH / 0.35 MEDIUM)\n"
             "- Triple Riding: Geometric overlap + posture filter (base COCO model)\n"
             "- Illegal Parking: ByteTrack position history (< 20px / 90 frames)\n"
             "- Stop-Line/Red-Light: Y-threshold crossing (base COCO bbox)"
         )
 
     else:
-        # Fallback: general DB summary
         cur.execute("SELECT COUNT(*) FROM violations")
         total = cur.fetchone()[0]
         cur.execute("SELECT violation_type, COUNT(*) as c FROM violations GROUP BY violation_type ORDER BY c DESC LIMIT 1")
@@ -940,7 +1025,7 @@ def agent_query(body: AgentQuery):
     return {"answer": answer, "question": body.question}
 
 # ── Escalation report ─────────────────────────────────────────────────────────
-@app.get("/api/report/{vid}")
+@app.get("/api/report/{vid}", dependencies=[Depends(require_auth)])
 def generate_report(vid: int):
     con = _db(); cur = con.cursor()
     cur.execute("SELECT * FROM violations WHERE id=?", (vid,))
@@ -992,7 +1077,6 @@ def generate_report(vid: int):
   <tr><td>Evidence Hash</td><td style="font-family:monospace;font-size:12px">{d.get("evidence_hash","—")}</td></tr>
   <tr><td>Hash Algorithm</td><td>SHA-256</td></tr>
   <tr><td>Signing Method</td><td>RSA-PSS (software key — prototype)</td></tr>
-  <tr><td>Database</td><td>SQLite · {str(DB_PATH)}</td></tr>
   <tr><td>Operator Action</td><td>{d.get("operator_action","PENDING") or "PENDING"}</td></tr>
 </table>
 
@@ -1014,4 +1098,3 @@ Immediate enforcement action is recommended. Please verify the plate number agai
 <script>window.onload = function(){{ window.print(); }}</script>
 </body></html>"""
     return HTMLResponse(content=html)
-

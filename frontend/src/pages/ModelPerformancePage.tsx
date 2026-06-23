@@ -5,9 +5,9 @@ const MODELS = [
     name: "Helmet Non-Compliance",
     color: "#e63946",
     colorLight: "#fde8ea",
-    mAP50:     0.852,
-    precision: 0.801,
-    recall:    0.779,
+    mAP50:     0.788,
+    precision: 0.845,
+    recall:    0.626,
     trainImages: 629,
     valImages:   158,
     classes: ["with_helmet", "without_helmet"],
@@ -17,9 +17,9 @@ const MODELS = [
     name: "Seatbelt Non-Compliance",
     color: "#f77f00",
     colorLight: "#fff1e0",
-    mAP50:     0.901,
-    precision: 0.888,
-    recall:    0.859,
+    mAP50:     0.911,
+    precision: 0.912,
+    recall:    0.842,
     trainImages: 660,
     valImages:   165,
     classes: ["with_seatbelt", "without_seatbelt"],
@@ -29,9 +29,9 @@ const MODELS = [
     name: "Wrong-Side Driving",
     color: "#2b9348",
     colorLight: "#e8f5e9",
-    mAP50:     0.975,
-    precision: 0.957,
-    recall:    0.958,
+    mAP50:     0.977,
+    precision: 0.943,
+    recall:    0.961,
     trainImages: 608,
     valImages:   152,
     classes: ["wrong_side"],
@@ -150,9 +150,9 @@ function ModelCard({ model }: { model: typeof MODELS[0] }) {
 }
 
 const COMPARISON = [
-  { metric: "mAP@50",    Helmet: 85.2, Seatbelt: 90.1, WrongSide: 97.5 },
-  { metric: "Precision", Helmet: 80.1, Seatbelt: 88.8, WrongSide: 95.7 },
-  { metric: "Recall",    Helmet: 77.9, Seatbelt: 85.9, WrongSide: 95.8 },
+  { metric: "mAP@50",    Helmet: 78.8, Seatbelt: 91.1, WrongSide: 97.7 },
+  { metric: "Precision", Helmet: 84.5, Seatbelt: 91.2, WrongSide: 94.3 },
+  { metric: "Recall",    Helmet: 62.6, Seatbelt: 84.2, WrongSide: 96.1 },
 ];
 
 export default function ModelPerformancePage() {
