@@ -1,7 +1,5 @@
 # DrishtiVia — AI Traffic Violation Detection System
 
-> **Flipkart Gridlock Hackathon 2.0** · Automated Photo & Video Identification of Traffic Violations Using Computer Vision
-
 DrishtiVia (Sanskrit: *दृष्टि* — vision) is a production-grade traffic violation detection system built for Bengaluru's road network. It combines YOLOv8s object detection, ByteTrack multi-object tracking, and three fine-tuned violation classifiers to automatically identify, classify, and document traffic violations from camera feeds and uploaded footage.
 
 ---
