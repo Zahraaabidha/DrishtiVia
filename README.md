@@ -1,12 +1,3 @@
----
-title: DrishtiVia
-emoji: 🚦
-colorFrom: blue
-colorTo: red
-sdk: docker
-pinned: false
----
-
 # DrishtiVia — AI Traffic Violation Detection System
 
 > **Flipkart Gridlock Hackathon 2.0** · Automated Photo & Video Identification of Traffic Violations Using Computer Vision
