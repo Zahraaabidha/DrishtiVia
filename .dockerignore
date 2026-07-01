@@ -1,0 +1,17 @@
+.git/
+.gitignore
+.claude/
+frontend/
+Helmet-Violation-Detection-11/
+helmet_dataset/
+seatbelt_dataset/
+wrongside_dataset/
+ridesafe_raw/
+data/
+evidence_store/snapshots/
+__pycache__/
+*.pyc
+*.pdf
+*.md
+yolo26n.pt
+yolov8n.pt

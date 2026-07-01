@@ -1,6 +1,11 @@
 import axios from "axios";
 
-const api = axios.create({ baseURL: "/api" });
+// In production (Vercel), set VITE_API_URL to your HF Space URL, e.g.:
+// https://yourusername-drishtivia.hf.space
+// In dev, leave it unset — Vite's proxy forwards /api to localhost:8000.
+const API_BASE = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, "") ?? "";
+
+const api = axios.create({ baseURL: `${API_BASE}/api` });
 
 export interface Stats {
   total: number;
@@ -140,12 +145,12 @@ export const detectVideo  = (file: File, opts: DetectOptions = {}): Promise<Dete
 export const verifyHash   = (evidence_hash: string) =>
   api.post("/verify", { evidence_hash }).then(r => r.data);
 export const snapshotUrl  = (hash: string, kind: "full" | "crop") =>
-  `/api/snapshot/${hash.slice(0, 16)}/${kind}`;
+  `${API_BASE}/api/snapshot/${hash.slice(0, 16)}/${kind}`;
 export const searchViolations = (q: string, limit = 50) =>
   api.get<{ results: Violation[]; count: number }>("/search", { params: { q, limit } }).then(r => r.data);
 export const agentQuery = (question: string) =>
   api.post<{ answer: string; question: string; source?: string }>("/agent", { question }).then(r => r.data);
-export const reportUrl = (id: number) => `/api/report/${id}`;
+export const reportUrl = (id: number) => `${API_BASE}/api/report/${id}`;
 export const saveViolation = (v: DetectionViolation, camera_id: string, plate: string = "UNREADABLE") =>
   api.post("/violations/save", {
     violation_type: v.type,
@@ -165,7 +170,7 @@ export const uploadVideoForStream = (
     const fd = new FormData();
     fd.append("file", file);
     const xhr = new XMLHttpRequest();
-    xhr.open("POST", "/api/detect/video/upload");
+    xhr.open("POST", `${API_BASE}/api/detect/video/upload`);
     if (onProgress) {
       xhr.upload.onprogress = (e) => {
         if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
@@ -197,7 +202,7 @@ export const liveStreamUrl = (
     flow_direction:     opts.flowDirection ?? "Left -> Right",
     camera_id:          opts.cameraId ?? "live_stream",
   });
-  return `/api/detect/stream/live?${p}`;
+  return `${API_BASE}/api/detect/stream/live?${p}`;
 };
 
 export const videoStreamUrl = (
@@ -215,5 +220,5 @@ export const videoStreamUrl = (
     flow_direction:     opts.flowDirection ?? "Left -> Right",
     camera_id:          opts.cameraId ?? "live_upload",
   });
-  return `/api/detect/video/stream/${sessionId}?${p}`;
+  return `${API_BASE}/api/detect/video/stream/${sessionId}?${p}`;
 };
