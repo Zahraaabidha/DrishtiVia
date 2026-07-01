@@ -49,10 +49,11 @@ WRONGSIDE_PATH = Path(os.getenv("WRONGSIDE_MODEL", str(BASE_DIR / "runs/detect/r
 # API key auth — set API_KEY env var to enable; leave blank to run without auth (dev/demo)
 _API_KEY = os.getenv("API_KEY", "").strip()
 
-# CORS — comma-separated list of allowed origins
-_CORS_ORIGINS = [o.strip() for o in os.getenv(
-    "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
-).split(",") if o.strip()]
+# CORS — set CORS_ORIGINS env var to restrict to specific origins in production.
+# Defaults to * so the split Vercel+HF Space deployment works out of the box.
+_CORS_ORIGINS_RAW = os.getenv("CORS_ORIGINS", "*").strip()
+_CORS_ORIGINS     = [o.strip() for o in _CORS_ORIGINS_RAW.split(",") if o.strip()]
+_CORS_WILDCARD    = _CORS_ORIGINS == ["*"]
 
 # File size limits
 MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_MB", "10"))  * 1024 * 1024
@@ -63,7 +64,7 @@ app = FastAPI(title="DrishtiVia API", version="2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_CORS_ORIGINS,
-    allow_credentials=True,
+    allow_credentials=not _CORS_WILDCARD,  # credentials=True requires explicit origins, not *
     allow_methods=["*"],
     allow_headers=["*"],
 )
