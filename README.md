@@ -338,16 +338,3 @@ DrishtiVia/
             └── VerifyPage.tsx
 ```
 
----
-
-## Team
-
-Built for **Flipkart Gridlock Hackathon 2.0**  
-Focus area: Automated Photo Identification and Classification of Traffic Violations Using Computer Vision  
-Target deployment: Bengaluru Traffic Police Control Room
-
----
-
-## License
-
-This project was built for a hackathon. Model weights trained on proprietary datasets are not included in this repository.
